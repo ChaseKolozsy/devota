@@ -2701,12 +2701,77 @@ class _SshTerminalTabState extends State<SshTerminalTab>
   Future<void> _loadVoiceQuietBeeps() async {
     final prefs = await SharedPreferences.getInstance();
     _voiceSession.quietBeeps = prefs.getBool(_voiceQuietBeepsKey) ?? true;
+    _voiceSession.control.modePhrases = {
+      for (final mode in VoiceMode.values)
+        mode:
+            prefs.getString('$_voiceModePhraseKey${mode.name}') ??
+            defaultModePhrases[mode]!,
+    };
+  }
+
+  static const _voiceModePhraseKey = 'voice_mode_phrase_';
+
+  /// Keeps [phrase] for [mode] unless it is empty or already another mode's,
+  /// which would make one phrase mean two things. Returns what was kept.
+  Future<String> _setVoiceModePhrase(VoiceMode mode, String phrase) async {
+    final spoken = normalizeSpoken(phrase);
+    final phrases = _voiceSession.control.modePhrases;
+    final taken = phrases.entries.any(
+      (e) => e.key != mode && normalizeSpoken(e.value) == spoken,
+    );
+    final kept = spoken.isEmpty || taken ? defaultModePhrases[mode]! : spoken;
+    _voiceSession.control.modePhrases = {...phrases, mode: kept};
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('$_voiceModePhraseKey${mode.name}', kept);
+    return kept;
   }
 
   Future<void> _setVoiceQuietBeeps(bool quiet) async {
     setState(() => _voiceSession.quietBeeps = quiet);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_voiceQuietBeepsKey, quiet);
+  }
+
+  /// What to say to switch voice modes: nonsense, so dictation never
+  /// switches by accident.
+  Widget _buildVoiceModePhraseFields(ThemeData theme) {
+    const what = {
+      VoiceMode.transcription: 'Transcription mode (everything is typed)',
+      VoiceMode.commands: 'Command mode (only commands act)',
+      VoiceMode.mixed: 'Mixed mode (commands act, the rest is typed)',
+    };
+    return Padding(
+      padding: const EdgeInsets.only(top: 4, bottom: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Voice: phrases that switch mode',
+            style: theme.textTheme.bodyMedium,
+          ),
+          Text(
+            'Say the whole phrase on its own. Pick words you never say '
+            'otherwise; repeated real words are heard most reliably.',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          for (final mode in VoiceMode.values)
+            TextFormField(
+              key: ValueKey('voice-mode-phrase-${mode.name}'),
+              initialValue: _voiceSession.control.modePhrases[mode],
+              decoration: InputDecoration(isDense: true, labelText: what[mode]),
+              onFieldSubmitted: (value) =>
+                  unawaited(_setVoiceModePhrase(mode, value)),
+              onChanged: (value) {
+                if (value.trim().isNotEmpty) {
+                  unawaited(_setVoiceModePhrase(mode, value));
+                }
+              },
+            ),
+        ],
+      ),
+    );
   }
 
   void _onVoiceChanged() {
@@ -3543,6 +3608,7 @@ class _SshTerminalTabState extends State<SshTerminalTab>
                           unawaited(_setVoiceQuietBeeps(v));
                         },
                       ),
+                    if (Platform.isAndroid) _buildVoiceModePhraseFields(theme),
                     if (_keepAliveInBackground &&
                         !_batteryOptimizationExempt &&
                         Platform.isAndroid)

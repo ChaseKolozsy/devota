@@ -108,6 +108,9 @@ class VoiceControl extends ChangeNotifier {
   /// Mixed, commands only, or transcription; switched by voice.
   VoiceMode mode = VoiceMode.mixed;
 
+  /// What the owner says to switch to each mode.
+  Map<VoiceMode, String> modePhrases = defaultModePhrases;
+
   /// The owner switched modes by voice (the tab remembers it).
   final void Function(VoiceMode mode)? onModeChanged;
 
@@ -132,7 +135,12 @@ class VoiceControl extends ChangeNotifier {
   VoiceReply handle(String utterance) {
     final heard = utterance.trim();
     if (heard.isEmpty) return const VoiceReply();
-    final match = matcher.match(heard, surface.voiceTargets, mode: mode);
+    final match = matcher.match(
+      heard,
+      surface.voiceTargets,
+      mode: mode,
+      modePhrases: modePhrases,
+    );
     final reply = _decide(heard, match);
     // Any command stops a reading first; dictation (and words command mode
     // ignores) let it carry on.

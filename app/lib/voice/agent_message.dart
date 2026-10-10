@@ -8,10 +8,7 @@ import 'screen_reader.dart';
 String speakableMessage(String text) {
   var s = text.replaceAll('\r', '');
   s = s.replaceAll(RegExp(r'```[\s\S]*?```'), ' (code on screen) ');
-  s = s.replaceAllMapped(
-    RegExp(r'\[([^\]]+)\]\([^)]+\)'),
-    (m) => m.group(1)!,
-  );
+  s = s.replaceAllMapped(RegExp(r'\[([^\]]+)\]\([^)]+\)'), (m) => m.group(1)!);
   s = s.replaceAll(RegExp(r'https?://\S+'), 'a link');
   s = s.replaceAll(RegExp(r'^\s{0,3}#{1,6}\s+', multiLine: true), '');
   s = s.replaceAll(RegExp(r'^\s*[-*+]\s+', multiLine: true), '');

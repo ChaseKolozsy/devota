@@ -250,7 +250,7 @@ void main() {
 
   group('modes', () {
     test('command mode: commands act, nothing else is typed', () {
-      final reply = control.handle('command mode');
+      final reply = control.handle('noodle noodle');
       expect(reply.speak, 'Command mode');
       expect(control.mode, VoiceMode.commands);
       expect(control.handle('page up').tone, 'command');
@@ -263,7 +263,7 @@ void main() {
     });
 
     test('transcription mode: everything is typed but the escapes', () {
-      control.handle('dictation mode');
+      control.handle('Wobble-wobble.');
       expect(control.mode, VoiceMode.transcription);
       control.handle('page up');
       control.handle('read screen');
@@ -274,17 +274,38 @@ void main() {
       control.handle('fix the build');
       control.handle('send');
       expect(surface.sends, 1);
-      control.handle('command mode');
+      control.handle('noodle noodle noodle');
       expect(control.mode, VoiceMode.commands);
     });
 
     test('mixed mode is the default and comes back by name', () {
       expect(control.mode, VoiceMode.mixed);
-      control.handle('transcription mode');
-      control.handle('normal mode');
+      control.handle('wobble wobble');
+      control.handle('jelly jelly');
       expect(control.mode, VoiceMode.mixed);
       control.handle('fix it');
       expect(surface.composer, 'fix it');
+    });
+
+    test('ordinary words never switch, even the mode names', () {
+      control.handle('wobble wobble');
+      for (final said in ['command mode', 'wobble', 'noodle', 'jelly beans']) {
+        control.handle(said);
+      }
+      expect(control.mode, VoiceMode.transcription);
+      expect(surface.composer, 'command mode wobble noodle jelly beans');
+    });
+
+    test('the owner may pick other phrases', () {
+      control.modePhrases = {
+        ...defaultModePhrases,
+        VoiceMode.commands: 'zippity zap',
+      };
+      control.handle('zippity zap');
+      expect(control.mode, VoiceMode.commands);
+      control.handle('noodle noodle');
+      expect(control.mode, VoiceMode.commands);
+      expect(control.statusLine, "heard 'noodle noodle' — not a command");
     });
 
     test('a switch is reported once for the tab to remember', () {
@@ -293,9 +314,9 @@ void main() {
         surface: surface,
         onModeChanged: changes.add,
       );
-      remembering.handle('command mode');
-      remembering.handle('command mode');
-      remembering.handle('mixed mode');
+      remembering.handle('noodle noodle');
+      remembering.handle('noodle noodle');
+      remembering.handle('jelly jelly');
       expect(changes, [VoiceMode.commands, VoiceMode.mixed]);
     });
   });

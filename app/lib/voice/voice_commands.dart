@@ -262,7 +262,32 @@ class ComposerEditMatch extends VoiceMatch {
 /// it or fix the text ([VoiceCommandMatcher.match]).
 enum VoiceMode { mixed, commands, transcription }
 
-/// "command mode", "transcription mode", "mixed mode".
+/// The nonsense phrases that switch modes. Nothing a person says while
+/// dictating, yet repeated real words, so the recognizer writes them the same
+/// way every time (invented words come back as whatever they sound like).
+const defaultModePhrases = <VoiceMode, String>{
+  VoiceMode.transcription: 'wobble wobble',
+  VoiceMode.commands: 'noodle noodle',
+  VoiceMode.mixed: 'jelly jelly',
+};
+
+/// [spoken] says [phrase] (both normalized), forgiving a repeated word the
+/// recognizer doubled or dropped: "wobble wobble wobble" is "wobble wobble".
+/// A one-word phrase must be heard exactly.
+bool saysModePhrase(String spoken, String phrase) {
+  if (phrase.isEmpty) return false;
+  if (spoken == phrase) return true;
+  final want = phrase.split(' ');
+  final heard = spoken.split(' ');
+  if (want.length < 2 || heard.length < 2) return false;
+  List<String> squeeze(List<String> words) => [
+    for (var i = 0; i < words.length; i++)
+      if (i == 0 || words[i] != words[i - 1]) words[i],
+  ];
+  return listEquals(squeeze(want), squeeze(heard));
+}
+
+/// The mode phrase ([defaultModePhrases] unless the owner set others).
 class ModeMatch extends VoiceMatch {
   const ModeMatch(this.mode);
   final VoiceMode mode;
@@ -291,18 +316,6 @@ class VoiceCommandMatcher {
   static const _readScreen = {'read screen', 'read the screen'};
   static const _readReply = {'read reply', 'read the reply'};
   static const _stopReading = {'stop reading'};
-  static const _modes = {
-    'command mode': VoiceMode.commands,
-    'commands mode': VoiceMode.commands,
-    'command only': VoiceMode.commands,
-    'commands only': VoiceMode.commands,
-    'transcription mode': VoiceMode.transcription,
-    'transcribe mode': VoiceMode.transcription,
-    'dictation mode': VoiceMode.transcription,
-    'typing mode': VoiceMode.transcription,
-    'mixed mode': VoiceMode.mixed,
-    'normal mode': VoiceMode.mixed,
-  };
   static const _readMessage = {
     'repeat',
     'repeat that',
@@ -345,12 +358,16 @@ class VoiceCommandMatcher {
     String utterance,
     List<VoiceTarget> targets, {
     VoiceMode mode = VoiceMode.mixed,
+    Map<VoiceMode, String> modePhrases = defaultModePhrases,
   }) {
     final text = utterance.trim();
     final spoken = normalizeSpoken(text);
     if (spoken.isEmpty) return DictationMatch(text);
-    final switchTo = _modes[spoken];
-    if (switchTo != null) return ModeMatch(switchTo);
+    for (final entry in modePhrases.entries) {
+      if (saysModePhrase(spoken, normalizeSpoken(entry.value))) {
+        return ModeMatch(entry.key);
+      }
+    }
     if (_stop.contains(spoken)) return const StopListeningMatch();
     if (_stopReading.contains(spoken)) return const StopReadingMatch();
     if (mode == VoiceMode.transcription) {
