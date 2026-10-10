@@ -12,6 +12,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'screen_reader.dart';
+import 'vim_commands.dart';
 import 'voice_commands.dart';
 
 /// The Terminal tab, as voice control sees it.
@@ -46,6 +47,9 @@ abstract class VoiceSurface {
   /// The last message an agent asked to have spoken (devota_speak), as it was
   /// read aloud, or null.
   String? get lastAgentMessage => null;
+
+  /// Types [keys] into the session, as a pad key does (vim commands).
+  void sendTerminalKeys(String keys);
 }
 
 /// What the Android service does after an utterance.
@@ -111,6 +115,12 @@ class VoiceControl extends ChangeNotifier {
   /// What the owner says to switch to each mode.
   Map<VoiceMode, String> modePhrases = defaultModePhrases;
 
+  /// Vim motions and edits are commands ("go to line 25", "end of line").
+  bool vimMode = false;
+
+  /// The owner turned vim mode on or off by voice.
+  void Function(bool on)? onVimChanged;
+
   /// The owner switched modes by voice (the tab remembers it).
   final void Function(VoiceMode mode)? onModeChanged;
 
@@ -140,6 +150,7 @@ class VoiceControl extends ChangeNotifier {
       surface.voiceTargets,
       mode: mode,
       modePhrases: modePhrases,
+      vim: vimMode,
     );
     final reply = _decide(heard, match);
     // Any command stops a reading first; dictation (and words command mode
@@ -179,6 +190,17 @@ class VoiceControl extends ChangeNotifier {
         VoiceReply(tone: 'command', speak: '$name mode'),
       );
     }
+    if (match is VimToggleMatch) {
+      if (vimMode != match.on) {
+        vimMode = match.on;
+        onVimChanged?.call(vimMode);
+      }
+      final state = vimMode ? 'on' : 'off';
+      return _status(
+        'vim mode $state',
+        VoiceReply(tone: 'command', speak: 'Vim $state'),
+      );
+    }
     if (match is NotACommandMatch) {
       return _status(
         "heard '$heard' — not a command",
@@ -210,6 +232,17 @@ class VoiceControl extends ChangeNotifier {
     switch (match) {
       case TargetMatch(:final target):
         return _runTarget(heard, target);
+      case VimMatch(:final command):
+        return _runTarget(
+          heard,
+          VoiceTarget(
+            kind: VoiceTargetKind.padKey,
+            id: 'vim',
+            label: 'vim ${command.label}',
+            confirm: command.confirm,
+            run: () => surface.sendTerminalKeys(vimNormal + command.keys),
+          ),
+        );
       case SendMatch():
         if (surface.composerText.trim().isEmpty) {
           return _status(
@@ -253,6 +286,7 @@ class VoiceControl extends ChangeNotifier {
       case ReadMatch():
       case ModeMatch():
       case NotACommandMatch():
+      case VimToggleMatch():
         return const VoiceReply();
     }
   }
@@ -460,9 +494,12 @@ class VoiceControlSession extends ChangeNotifier {
   /// "Voice: heard 'page up' — Page Up", or why it stopped.
   String? get statusLine {
     if (_enabled) {
-      final mode = control.mode == VoiceMode.mixed
-          ? ''
-          : ' (${modeName(control.mode).toLowerCase()})';
+      final tags = [
+        if (control.mode != VoiceMode.mixed)
+          modeName(control.mode).toLowerCase(),
+        if (control.vimMode) 'vim',
+      ];
+      final mode = tags.isEmpty ? '' : ' (${tags.join(', ')})';
       return 'Voice$mode: ${control.statusLine}';
     }
     if (message != null) return 'Voice: $message';

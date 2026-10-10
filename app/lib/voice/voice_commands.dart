@@ -14,6 +14,8 @@ library;
 
 import 'package:flutter/foundation.dart';
 
+import 'vim_commands.dart';
+
 enum VoiceTargetKind { padKey, arrow, tmux, macro, command }
 
 /// One button the owner can name.
@@ -301,6 +303,18 @@ class ModeMatch extends VoiceMatch {
   final VoiceMode mode;
 }
 
+/// "vim mode" / "vim off".
+class VimToggleMatch extends VoiceMatch {
+  const VimToggleMatch(this.on);
+  final bool on;
+}
+
+/// A vim motion or edit, while vim mode is on.
+class VimMatch extends VoiceMatch {
+  const VimMatch(this.command);
+  final VimCommand command;
+}
+
 /// Command mode heard something that names no command.
 class NotACommandMatch extends VoiceMatch {
   const NotACommandMatch(this.text);
@@ -426,6 +440,7 @@ class VoiceCommandMatcher {
     List<VoiceTarget> targets, {
     VoiceMode mode = VoiceMode.mixed,
     Map<VoiceMode, String> modePhrases = defaultModePhrases,
+    bool vim = false,
   }) {
     final text = utterance.trim();
     final spoken = normalizeSpoken(text);
@@ -451,6 +466,12 @@ class VoiceCommandMatcher {
     if (_send.contains(spoken)) return const SendMatch();
     final edit = _composerEdit(spoken);
     if (edit != null) return edit;
+    if (vimOnPhrases.contains(spoken)) return const VimToggleMatch(true);
+    if (vimOffPhrases.contains(spoken)) return const VimToggleMatch(false);
+    if (vim) {
+      final command = parseVimCommand(spoken, text);
+      if (command != null) return VimMatch(command);
+    }
     final target = _named(vocabulary(targets), spoken);
     if (target != null) return TargetMatch(target);
     return mode == VoiceMode.commands

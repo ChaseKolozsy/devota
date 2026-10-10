@@ -486,7 +486,7 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     requestMicrophone:
         widget.testHooks?.requestMicrophone ?? _voice.requestMicrophone,
     onModeChanged: (mode) => unawaited(_saveVoiceMode(mode)),
-  );
+  )..control.onVimChanged = (on) => unawaited(_saveVoiceVim(on));
   late final _notificationBridge = TerminalNotificationBridge(
     _watch,
     active: widget.active,
@@ -902,6 +902,14 @@ class _SshTerminalTabState extends State<SshTerminalTab>
   void _applyVoiceMode(SharedPreferences prefs) {
     final mode = VoiceMode.values.asNameMap()[prefs.getString(_voiceModeKey)];
     if (mode != null) _voiceSession.control.mode = mode;
+    _voiceSession.control.vimMode = prefs.getBool(_voiceVimKey) ?? false;
+  }
+
+  static const _voiceVimKey = 'voice_vim';
+
+  Future<void> _saveVoiceVim(bool on) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_voiceVimKey, on);
   }
 
   static const _voiceModeKey = 'voice_mode';
@@ -2916,6 +2924,9 @@ class _SshTerminalTabState extends State<SshTerminalTab>
 
   @override
   String get composerText => _composerController.text;
+
+  @override
+  void sendTerminalKeys(String keys) => _sendTerminalKey(keys);
 
   @override
   void appendDictation(String text) {

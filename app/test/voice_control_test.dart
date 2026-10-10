@@ -16,6 +16,9 @@ class FakeSurface implements VoiceSurface {
   @override
   String? lastAgentMessage;
   final ran = <String>[];
+  final keys = <String>[];
+  @override
+  void sendTerminalKeys(String sent) => keys.add(sent);
   int sends = 0;
   List<VoiceTarget> Function(FakeSurface) build = defaultTargets;
 
@@ -318,6 +321,73 @@ void main() {
       remembering.handle('noodle noodle');
       remembering.handle('jelly jelly');
       expect(changes, [VoiceMode.commands, VoiceMode.mixed]);
+    });
+  });
+
+  group('vim', () {
+    const n = '\x1c\x0e';
+
+    test('off until asked; then motions go to Normal mode first', () {
+      expect(control.handle('go to line 25').tone, 'dictation');
+      surface.composer = '';
+      expect(control.handle('vim mode').speak, 'Vim on');
+      final said = {
+        'go to line twenty five': '${n}25G',
+        'line 3': '${n}3G',
+        'top': '${n}gg',
+        'scroll to bottom': '${n}G',
+        'beginning of line': '${n}0',
+        'end of the line': '$n\$',
+        'next word': '${n}w',
+        'down five lines': '${n}5j',
+        '3 lines up': '${n}3k',
+        'matching paren': '$n%',
+        'undo': '${n}u',
+        'save': '$n:w\r',
+        'Search for parseCount': '$n/parseCount\r',
+      };
+      for (final entry in said.entries) {
+        surface.keys.clear();
+        expect(control.handle(entry.key).tone, 'command', reason: entry.key);
+        expect(surface.keys, [entry.value], reason: entry.key);
+      }
+      expect(surface.composer, isEmpty);
+    });
+
+    test('plain up and down stay the arrow keys', () {
+      surface.build = (s) => [
+        VoiceTarget(
+          kind: VoiceTargetKind.arrow,
+          id: 'up',
+          label: 'Up',
+          run: () => s.ran.add('up'),
+        ),
+      ];
+      control.handle('vim on');
+      control.handle('up');
+      expect(surface.ran, ['up']);
+      expect(surface.keys, isEmpty);
+    });
+
+    test('quitting without saving asks first; vim off ends it', () {
+      final changes = <bool>[];
+      control.onVimChanged = changes.add;
+      control.handle('vim mode');
+      expect(control.handle('quit without saving').speak, 'Say yes to confirm');
+      expect(surface.keys, isEmpty);
+      control.handle('yes');
+      expect(surface.keys, ['\x1c\x0e:q!\r']);
+      control.handle('vim off');
+      expect(control.handle('undo').tone, 'dictation');
+      expect(changes, [true, false]);
+    });
+
+    test('not in transcription mode', () {
+      control.handle('vim mode');
+      control.handle('wobble wobble');
+      control.handle('undo');
+      expect(surface.keys, isEmpty);
+      expect(surface.composer, 'undo');
     });
   });
 
