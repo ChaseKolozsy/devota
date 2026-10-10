@@ -194,6 +194,17 @@ void main() {
     await settle(tester);
   });
 
+  testWidgets('symbols said by name are typed as symbols', (tester) async {
+    await pumpTab(tester);
+    await toggleOn(tester);
+    final reply = await say(tester, 'print open paren');
+    expect(reply?['tone'], 'dictation');
+    await say(tester, 'x close paren');
+    expect(composer(tester), 'print(x)');
+    expect(writes, isEmpty);
+    await settle(tester);
+  });
+
   testWidgets('tmux row commands run the tmux buttons', (tester) async {
     await pumpTab(tester);
     await toggleOn(tester);

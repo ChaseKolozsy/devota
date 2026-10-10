@@ -34,6 +34,7 @@ import 'terminal_profiles.dart';
 import 'voice_input_service.dart';
 import 'voice/voice_commands.dart';
 import 'voice/agent_message.dart';
+import 'voice/spoken_symbols.dart';
 import 'voice/voice_control.dart';
 
 /// A foldable terminal tool bar (tmux / macros / cmds). When folded its content
@@ -2917,7 +2918,16 @@ class _SshTerminalTabState extends State<SshTerminalTab>
   String get composerText => _composerController.text;
 
   @override
-  void appendDictation(String text) => _appendComposerText(text);
+  void appendDictation(String text) {
+    if (text.trim().isEmpty) return;
+    _composerController.text = appendDictatedText(
+      _composerController.text,
+      text,
+    );
+    _composerController.selection = TextSelection.fromPosition(
+      TextPosition(offset: _composerController.text.length),
+    );
+  }
 
   @override
   bool submitComposer() {
