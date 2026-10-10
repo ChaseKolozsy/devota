@@ -144,6 +144,21 @@ class MainActivity : FlutterActivity() {
                     startActivity(intent)
                     result.success(true)
                 }
+                "openUrl" -> {
+                    // A sign-in link from the terminal: only web links, in the
+                    // phone's own browser (providers block in-app sign-in).
+                    val uri = Uri.parse(call.argument<String>("url")?.trim().orEmpty())
+                    if (uri.scheme != "https" && uri.scheme != "http") {
+                        result.error("bad_args", "only http(s) links open", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        startActivity(Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE))
+                        result.success(true)
+                    } catch (_: ActivityNotFoundException) {
+                        result.success(false)
+                    }
+                }
                 "openAppStore" -> {
                     val packageName = call.argument<String>("packageName")?.trim().orEmpty()
                     if (packageName.isEmpty()) {

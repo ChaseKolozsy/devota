@@ -444,3 +444,25 @@ with the token the server writes, readable only by its user, to
 `<repo-root>/.devota-cache/compose-token`; `devota-compose` and the MCP tool
 read it from there (or from `DEVOTA_COMPOSE_TOKEN`).
 
+## Signing a computer's CLI in from the phone
+
+The key button in the terminal header signs a command-line tool on the
+computer in from the phone — no remote desktop needed. Run the login command
+(`gh auth login`, `gh auth refresh -s …`, `codex login`, `codex login
+--device-auth`, `gcloud auth login`, …), then tap the key. DevOTA reads the
+current tmux pane with wrapped lines joined and:
+
+- finds the newest sign-in link and any one-time code (`gh` shows no link, only
+  "Press Enter to open github.com…": DevOTA opens `https://github.com/login/device`
+  and presses Enter for it);
+- copies the code and opens the link in the phone's own browser (providers
+  refuse sign-in inside an app);
+- when the link returns to `http://localhost:<port>/…` on the computer (Codex's
+  browser login uses 1455), listens on that same port on the phone's loopback
+  for 10 minutes and passes each request over the SSH connection to
+  `127.0.0.1:<port>` on the computer with `curl`, showing the CLI's answer in
+  the browser.
+
+The relay accepts only GET, only URL-safe characters, only on loopback, and
+closes 20 seconds after the last request. `curl` must exist where tmux runs.
+

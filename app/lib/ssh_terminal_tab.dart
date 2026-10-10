@@ -15,6 +15,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xterm/xterm.dart';
 
 import 'backup_service.dart';
+import 'auth_relay.dart';
 import 'background_session_service.dart';
 import 'macro_reorder.dart';
 import 'macro_sync_service.dart';
@@ -583,6 +584,7 @@ class _SshTerminalTabState extends State<SshTerminalTab>
   void dispose() {
     _disposing = true;
     _composeInboxTimer?.cancel();
+    unawaited(_authRelay?.close());
     _voiceSession.removeListener(_onVoiceChanged);
     _voiceSession.dispose();
     _watch.removeListener(_onWatchChanged);
@@ -2051,6 +2053,98 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     );
   }
 
+  AuthCallbackRelay? _authRelay;
+  static const _appChannel = MethodChannel(
+    'io.github.chasekolozsy.devota/control_agent',
+  );
+
+  /// The terminal's text with soft-wrapped lines joined, so a long link reads
+  /// whole (fallback when tmux is not there to ask).
+  String _terminalScreenText() {
+    final out = StringBuffer();
+    final lines = _terminal.buffer.lines;
+    for (var i = 0; i < lines.length; i++) {
+      final line = lines[i];
+      if (i > 0 && !line.isWrapped) out.write('\n');
+      out.write(line.getText().trimRight());
+    }
+    return out.toString();
+  }
+
+  /// Signs a CLI on the computer in from this phone: finds the sign-in link
+  /// (and one-time code) on the screen, copies the code, opens the link in
+  /// the phone's browser and, when the provider returns to a localhost port on
+  /// the computer, relays that return over SSH (see auth_relay.dart).
+  Future<void> _signInFromPhone() async {
+    final client = _client;
+    if (!_connected || client == null) {
+      setState(() => _status = 'Connect first, then run the login command.');
+      return;
+    }
+    final router = sshHostRouter(
+      client,
+      isCurrent: () => identical(_client, client) && _connected,
+      route: _watchRoute,
+    );
+    String screen;
+    try {
+      // -J joins wrapped lines, so a link longer than the screen stays whole.
+      screen = await router.execute('tmux capture-pane -p -J -S -200');
+    } catch (_) {
+      screen = _terminalScreenText();
+    }
+    final prompt =
+        findAuthPrompt(screen) ?? findAuthPrompt(_terminalScreenText());
+    if (!mounted) return;
+    if (prompt == null) {
+      setState(
+        () => _status =
+            'No sign-in link on the screen. Run the login command, then tap Sign in.',
+      );
+      return;
+    }
+    await _authRelay?.close();
+    _authRelay = null;
+    final port = prompt.callbackPort;
+    if (port != null) {
+      final relay = AuthCallbackRelay(
+        port: port,
+        forward: (port, target) async {
+          final output = await router.execute(relayCurlCommand(port, target));
+          return parseCurlResponse(utf8.encode(output));
+        },
+        onEvent: (message) {
+          if (mounted) setState(() => _status = message);
+        },
+      );
+      try {
+        await relay.start();
+        _authRelay = relay;
+      } catch (error) {
+        if (mounted) setState(() => _status = 'Sign-in relay: $error');
+        return;
+      }
+    }
+    final code = prompt.code;
+    if (code != null) await Clipboard.setData(ClipboardData(text: code));
+    // gh waits for Enter before it starts waiting for the sign-in.
+    if (prompt.needsEnter) _writeToSession('\r');
+    try {
+      await _appChannel.invokeMethod<bool>('openUrl', {'url': prompt.url});
+    } catch (_) {
+      await Clipboard.setData(ClipboardData(text: prompt.url));
+    }
+    if (!mounted) return;
+    setState(
+      () => _status = [
+        'Sign in in the browser.',
+        if (code != null) 'Code $code is copied: paste it there.',
+        if (port != null)
+          'DevOTA passes the return to the computer (port $port) for 10 minutes.',
+      ].join(' '),
+    );
+  }
+
   Timer? _composeInboxTimer;
   bool _composeInboxBusy = false;
   static const _composeInboxInterval = Duration(seconds: 3);
@@ -2878,6 +2972,11 @@ class _SshTerminalTabState extends State<SshTerminalTab>
                 selected: _nativeKeyboardLocked,
                 onPressed: () =>
                     _setNativeKeyboardLocked(!_nativeKeyboardLocked),
+              ),
+              _terminalPanelIconButton(
+                icon: const Icon(Icons.key),
+                tooltip: 'Sign in from this phone',
+                onPressed: _connected ? _signInFromPhone : null,
               ),
               _terminalPanelIconButton(
                 icon: Icon(
