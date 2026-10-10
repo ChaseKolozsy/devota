@@ -51,6 +51,17 @@ void main() {
     expect(prompt.needsEnter, isTrue);
   });
 
+  test('newer gh names the full link in its Enter prompt', () {
+    const screen = '''
+! First copy your one-time code: 4E05-55F7
+Press Enter to open https://github.com/login/device in your browser...
+''';
+    final prompt = findAuthPrompt(screen)!;
+    expect(prompt.url, 'https://github.com/login/device');
+    expect(prompt.code, '4E05-55F7');
+    expect(prompt.needsEnter, isTrue);
+  });
+
   test('the newest prompt wins and plain screens have none', () {
     expect(findAuthPrompt('ls -la\nREADME.md\n'), isNull);
     expect(findAuthPrompt('Server on http://localhost:8080/\n'), isNull);
@@ -64,7 +75,11 @@ void main() {
       "curl -sS -i --max-time 25 'http://127.0.0.1:1455/auth/callback?code=a1&state=b%20c'",
     );
     for (final bad in ["/x'; rm -rf ~;'", '/a b', 'nohost', '/\$(id)']) {
-      expect(() => relayCurlCommand(1455, bad), throwsArgumentError, reason: bad);
+      expect(
+        () => relayCurlCommand(1455, bad),
+        throwsArgumentError,
+        reason: bad,
+      );
     }
     expect(() => relayCurlCommand(0, '/'), throwsArgumentError);
   });
@@ -86,7 +101,9 @@ void main() {
       port: 0,
       forward: (port, target) async {
         seen.add(target);
-        return RelayedResponse(200, {'content-type': 'text/plain'}, utf8.encode('signed in'));
+        return RelayedResponse(200, {
+          'content-type': 'text/plain',
+        }, utf8.encode('signed in'));
       },
     );
     // Port 0 cannot be the CLI's port; bind a free one the way the CLI would.
@@ -96,12 +113,16 @@ void main() {
     final real = AuthCallbackRelay(port: port, forward: relay.forward);
     await real.start();
     final client = HttpClient();
-    final request = await client.getUrl(Uri.parse('http://127.0.0.1:$port/auth/callback?code=xyz&state=s'));
+    final request = await client.getUrl(
+      Uri.parse('http://127.0.0.1:$port/auth/callback?code=xyz&state=s'),
+    );
     final response = await request.close();
     expect(response.statusCode, 200);
     expect(await utf8.decodeStream(response), 'signed in');
     expect(seen, ['/auth/callback?code=xyz&state=s']);
-    final post = await (await client.postUrl(Uri.parse('http://127.0.0.1:$port/x'))).close();
+    final post = await (await client.postUrl(
+      Uri.parse('http://127.0.0.1:$port/x'),
+    )).close();
     expect(post.statusCode, 405);
     client.close(force: true);
     await real.close();

@@ -61,10 +61,12 @@ bool _isLoopbackHost(String host) =>
     host == '[::1]' ||
     host == '::1';
 
-/// `gh` prints no link, only "Press Enter to open github.com in your
-/// browser..." after the code; its device page is `https://<host>/login/device`.
+/// `gh` waits for Enter before it starts waiting: "Press Enter to open
+/// github.com in your browser..." (older) or "... open
+/// https://github.com/login/device in your browser..." (newer). The older
+/// wording carries no link; its device page is `https://<host>/login/device`.
 final _ghEnterPrompt = RegExp(
-  r'press enter to open ([A-Za-z0-9.-]+\.[A-Za-z]{2,}) in your browser',
+  r'press enter to open (\S+) in your\s*browser',
   caseSensitive: false,
 );
 
@@ -101,9 +103,12 @@ AuthPrompt? findAuthPrompt(String screen) {
   final code =
       _codeAfterWord.allMatches(screen).lastOrNull?.group(1) ??
       _dashedCode.allMatches(screen).lastOrNull?.group(1);
-  if (enter != null && enter.start > bestAt) {
+  if (enter != null && enter.start >= bestAt - enter.group(0)!.length) {
+    final target = enter.group(1)!;
     return AuthPrompt(
-      url: 'https://${enter.group(1)!.toLowerCase()}/login/device',
+      url: target.startsWith('http')
+          ? target
+          : 'https://${target.toLowerCase()}/login/device',
       code: code?.toUpperCase(),
       needsEnter: true,
     );
