@@ -469,6 +469,7 @@ class _SshTerminalTabState extends State<SshTerminalTab>
   bool _usePrivateKey = false;
   bool _busy = false;
   bool _connected = false;
+  Timer? _keyRepeatTimer;
   bool _recording = false;
   bool _transcribing = false;
   bool _tmuxScrollMode = false;
@@ -585,6 +586,7 @@ class _SshTerminalTabState extends State<SshTerminalTab>
   void dispose() {
     _disposing = true;
     _composeInboxTimer?.cancel();
+    _stopKeyRepeat();
     unawaited(_authRelay?.close());
     _voiceSession.removeListener(_onVoiceChanged);
     _voiceSession.dispose();
@@ -3825,51 +3827,111 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     final enabled =
         (_connected || key.enabledWhenDisconnected) && !_inputLocked;
     final icon = _padKeyIcon(key.iconName);
+    final repeats = _padKeyRepeats(key);
+    // The rows scroll sideways, so the keys can be wide enough to hit.
     final button = SizedBox(
       height: 30,
       child: OutlinedButton(
         style: OutlinedButton.styleFrom(
           visualDensity: VisualDensity.compact,
-          minimumSize: const Size(34, 30),
-          padding: const EdgeInsets.symmetric(horizontal: 8),
+          minimumSize: const Size(48, 30),
+          padding: const EdgeInsets.symmetric(horizontal: 12),
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
         ),
         onPressed: enabled ? _padKeyTap(key) : null,
+        onLongPress: enabled && repeats ? () => _startKeyRepeat(key) : null,
         child: icon != null
-            ? Icon(icon, size: 16)
+            ? Icon(icon, size: 18)
             : Text(key.abbreviation, maxLines: 1),
       ),
     );
-    return Tooltip(message: key.name, child: button);
+    return Tooltip(
+      message: key.name,
+      // Its own long press would take the hold that repeats the key.
+      triggerMode: repeats ? TooltipTriggerMode.manual : null,
+      child: _keyRepeatListener(button),
+    );
   }
+
+  /// Backspace repeats while held, like a keyboard's.
+  bool _padKeyRepeats(TerminalPadKey key) {
+    final sequence = decodeKeySequence(key.sequence);
+    return key.id == 'backspace' || sequence == '\x7F' || sequence == '\b';
+  }
+
+  /// Holding a repeating key sends it once when the hold registers, then keeps
+  /// sending it, faster after the first few, until the finger lifts.
+  void _startKeyRepeat(TerminalPadKey key) {
+    _stopKeyRepeat();
+    _activateTerminalPadKey(key);
+    var sent = 1;
+    void tick() {
+      if (!mounted || _inputLocked) {
+        _stopKeyRepeat();
+        return;
+      }
+      _runPadKeyAction(key);
+      sent++;
+      _keyRepeatTimer = Timer(_keyRepeatInterval(sent), tick);
+    }
+
+    _keyRepeatTimer = Timer(_keyRepeatInterval(sent), tick);
+  }
+
+  static Duration _keyRepeatInterval(int sent) =>
+      Duration(milliseconds: sent < 8 ? 100 : 40);
+
+  void _stopKeyRepeat() {
+    _keyRepeatTimer?.cancel();
+    _keyRepeatTimer = null;
+  }
+
+  /// Lifting the finger anywhere ends a repeat, even after it slid off the key.
+  Widget _keyRepeatListener(Widget child) => Listener(
+    onPointerUp: (_) => _stopKeyRepeat(),
+    onPointerCancel: (_) => _stopKeyRepeat(),
+    child: child,
+  );
 
   Widget _buildPadFixedRightButton(TerminalPadKey key) {
     final enabled =
         (_connected || key.enabledWhenDisconnected) && !_inputLocked;
     final icon = _padKeyIcon(key.iconName);
+    final repeats = _padKeyRepeats(key);
     return Tooltip(
       message: key.name,
+      triggerMode: repeats ? TooltipTriggerMode.manual : null,
       child: Semantics(
         button: true,
         label: key.name,
-        child: SizedBox(
-          height: 30,
-          child: OutlinedButton(
-            style: OutlinedButton.styleFrom(
-              visualDensity: VisualDensity.compact,
-              minimumSize: const Size(30, 30),
-              padding: EdgeInsets.symmetric(horizontal: icon != null ? 0 : 8),
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        child: _keyRepeatListener(
+          SizedBox(
+            height: 30,
+            width: _padFixedKeyWidth,
+            child: OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+                minimumSize: const Size(_padFixedKeyWidth, 30),
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              onPressed: enabled ? _padKeyTap(key) : null,
+              onLongPress: enabled && repeats
+                  ? () => _startKeyRepeat(key)
+                  : null,
+              child: icon != null
+                  ? Icon(icon, size: 20)
+                  : Text(key.abbreviation, maxLines: 1),
             ),
-            onPressed: enabled ? _padKeyTap(key) : null,
-            child: icon != null
-                ? Icon(icon, size: 18)
-                : Text(key.abbreviation, maxLines: 1),
           ),
         ),
       ),
     );
   }
+
+  /// Backspace and Enter at the row ends: wide, since the rows beside them
+  /// scroll and need no room saved.
+  static const double _padFixedKeyWidth = 64;
 
   static const _arrowKeys = <_ArrowKey>[
     _ArrowKey(
