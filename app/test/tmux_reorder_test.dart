@@ -34,47 +34,98 @@ void main() {
     });
     await _pumpTerminal(tester);
 
-    // Arranged buttons lead in the saved order; the rest keep catalog order.
-    expect(_left(tester, 'Detach'), lessThan(_left(tester, 'Next')));
-    expect(_left(tester, 'Next'), lessThan(_left(tester, 'New')));
-    expect(_left(tester, 'New'), lessThan(_left(tester, 'Prev')));
-    expect(_left(tester, 'Prev'), lessThan(_left(tester, '0')));
+    // The saved buttons keep their order; each unsaved one sits right after
+    // its nearest catalog predecessor (New has none, so it leads).
+    final order = ['New', 'Detach', 'Next', 'Prev', '0', '1', '5', 'Prefix'];
+    for (var i = 1; i < order.length; i++) {
+      expect(_left(tester, order[i - 1]), lessThan(_left(tester, order[i])));
+    }
   });
 
-  testWidgets('the default row is New, Next, Prev, windows 0-5, then the rest', (
+  testWidgets('window buttons join an older arrangement beside Prev', (
     tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(1400, 800));
     addTearDown(() => tester.binding.setSurfaceSize(null));
+    // Arranged on a build that had no window buttons.
     SharedPreferences.setMockInitialValues({
-      // Heavy use of Prefix no longer pulls it ahead of the window buttons.
-      'terminal_key_usage_counts_json': jsonEncode({'tmux_prefix': 50}),
+      'terminal_tmux_order_json': jsonEncode([
+        'tmux_next',
+        'tmux_prev',
+        'tmux_new',
+        'tmux_scroll',
+        'tmux_prefix',
+        'tmux_list',
+        'tmux_mouse',
+        'tmux_split_vertical',
+        'tmux_split_horizontal',
+        'tmux_detach',
+      ]),
     });
-    final sent = <String>[];
-    await tester.pumpWidget(
-      MaterialApp(
-        home: Scaffold(
-          body: SizedBox(
-            width: 1400,
-            height: 700,
-            child: SshTerminalTab(
-              dio: Dio(),
-              serverUrl: '',
-              testHooks: SshTerminalTestHooks(sessionSink: sent.add),
-            ),
-          ),
-        ),
-      ),
-    );
-    await tester.pump();
-    final order = ['New', 'Next', 'Prev', '0', '1', '2', '3', '4', '5', 'Prefix'];
+    await _pumpTerminal(tester);
+    final order = [
+      'Next',
+      'Prev',
+      '0',
+      '1',
+      '2',
+      '3',
+      '4',
+      '5',
+      'New',
+      'Scroll',
+    ];
     for (var i = 1; i < order.length; i++) {
       expect(_left(tester, order[i - 1]), lessThan(_left(tester, order[i])));
     }
-    await tester.tap(find.widgetWithText(OutlinedButton, '3'));
-    await tester.pump();
-    expect(sent.join(), contains('\x023'));
   });
+
+  testWidgets(
+    'the default row is New, Next, Prev, windows 0-5, then the rest',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1400, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      SharedPreferences.setMockInitialValues({
+        // Heavy use of Prefix no longer pulls it ahead of the window buttons.
+        'terminal_key_usage_counts_json': jsonEncode({'tmux_prefix': 50}),
+      });
+      final sent = <String>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 1400,
+              height: 700,
+              child: SshTerminalTab(
+                dio: Dio(),
+                serverUrl: '',
+                testHooks: SshTerminalTestHooks(sessionSink: sent.add),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      final order = [
+        'New',
+        'Next',
+        'Prev',
+        '0',
+        '1',
+        '2',
+        '3',
+        '4',
+        '5',
+        'Prefix',
+      ];
+      for (var i = 1; i < order.length; i++) {
+        expect(_left(tester, order[i - 1]), lessThan(_left(tester, order[i])));
+      }
+      await tester.tap(find.widgetWithText(OutlinedButton, '3'));
+      await tester.pump();
+      expect(sent.join(), contains('\x023'));
+    },
+  );
 
   testWidgets('holding a tmux button and dragging it moves it and is kept', (
     tester,
@@ -91,7 +142,9 @@ void main() {
     var elapsed = kLongPressTimeout + const Duration(milliseconds: 20);
     await tester.pump(elapsed);
     // Slowly, so the drop lands where the finger stops (no flick).
-    final target = tester.getCenter(find.widgetWithText(OutlinedButton, 'Prefix'));
+    final target = tester.getCenter(
+      find.widgetWithText(OutlinedButton, 'Prefix'),
+    );
     final start = tester.getCenter(find.widgetWithText(OutlinedButton, 'List'));
     const steps = 20;
     final step = Offset((target.dx - start.dx - 20) / steps, 0);

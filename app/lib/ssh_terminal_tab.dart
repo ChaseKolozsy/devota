@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:dartssh2/dartssh2.dart';
 import 'package:dio/dio.dart';
@@ -2911,91 +2912,122 @@ class _SshTerminalTabState extends State<SshTerminalTab>
         borderRadius: BorderRadius.circular(8),
         child: Padding(
           padding: const EdgeInsets.fromLTRB(10, 6, 4, 6),
-          child: Row(
-            children: [
-              Icon(
-                _connected ? Icons.link : Icons.link_off,
-                size: 20,
-                color: _connected ? theme.colorScheme.primary : null,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      _connected ? 'SSH connected' : connectionLabel,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.labelLarge,
+          child: LayoutBuilder(
+            builder: (context, box) {
+              final headerWidth = box.maxWidth;
+              return Row(
+                children: [
+                  Icon(
+                    _connected ? Icons.link : Icons.link_off,
+                    size: 20,
+                    color: _connected ? theme.colorScheme.primary : null,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _connected ? 'SSH connected' : connectionLabel,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.labelLarge,
+                        ),
+                        Text(
+                          subtitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
                     ),
-                    Text(
-                      subtitle,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                  // The buttons scroll sideways when the screen is too narrow for
+                  // all of them (the label gives way first).
+                  ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxWidth: math.max(0, headerWidth - 28),
+                    ),
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _terminalPanelIconButton(
+                            icon: Icon(
+                              _connected ? Icons.link_off : Icons.link,
+                            ),
+                            tooltip: _connected ? 'Disconnect' : 'Connect',
+                            onPressed: _busy
+                                ? null
+                                : () => _connected ? _disconnect() : _connect(),
+                          ),
+                          if (defaultTargetPlatform == TargetPlatform.android)
+                            _terminalPanelIconButton(
+                              icon: Icon(
+                                _voiceSession.enabled
+                                    ? Icons.mic
+                                    : Icons.mic_none,
+                              ),
+                              tooltip: _voiceSession.enabled
+                                  ? 'Voice control on'
+                                  : 'Voice control off',
+                              selected: _voiceSession.enabled,
+                              onPressed: _voiceSession.starting
+                                  ? null
+                                  : () => unawaited(_toggleVoiceControl()),
+                            ),
+                          _buildTerminalFontControls(theme),
+                          _terminalPanelIconButton(
+                            icon: Icon(
+                              _nativeKeyboardLocked
+                                  ? Icons.keyboard_hide
+                                  : Icons.keyboard,
+                            ),
+                            tooltip: _nativeKeyboardLocked
+                                ? 'Native keyboard locked off'
+                                : 'Native keyboard allowed',
+                            selected: _nativeKeyboardLocked,
+                            onPressed: () => _setNativeKeyboardLocked(
+                              !_nativeKeyboardLocked,
+                            ),
+                          ),
+                          _terminalPanelIconButton(
+                            icon: const Icon(Icons.key),
+                            tooltip: 'Sign in from this phone',
+                            onPressed: _connected ? _signInFromPhone : null,
+                          ),
+                          _terminalPanelIconButton(
+                            icon: Icon(
+                              widget.fullscreen
+                                  ? Icons.fullscreen_exit
+                                  : Icons.fullscreen,
+                            ),
+                            tooltip: widget.fullscreen
+                                ? 'Show DevOTA tabs'
+                                : 'Hide DevOTA tabs',
+                            selected: widget.fullscreen,
+                            onPressed: widget.onFullscreenChanged == null
+                                ? null
+                                : () => widget.onFullscreenChanged!(
+                                    !widget.fullscreen,
+                                  ),
+                          ),
+                          _terminalPanelIconButton(
+                            icon: const Icon(Icons.settings),
+                            tooltip: 'SSH settings',
+                            onPressed: _showConnectionSheet,
+                          ),
+                        ],
                       ),
                     ),
-                  ],
-                ),
-              ),
-              _terminalPanelIconButton(
-                icon: Icon(_connected ? Icons.link_off : Icons.link),
-                tooltip: _connected ? 'Disconnect' : 'Connect',
-                onPressed: _busy
-                    ? null
-                    : () => _connected ? _disconnect() : _connect(),
-              ),
-              if (defaultTargetPlatform == TargetPlatform.android)
-                _terminalPanelIconButton(
-                  icon: Icon(
-                    _voiceSession.enabled ? Icons.mic : Icons.mic_none,
                   ),
-                  tooltip: _voiceSession.enabled
-                      ? 'Voice control on'
-                      : 'Voice control off',
-                  selected: _voiceSession.enabled,
-                  onPressed: _voiceSession.starting
-                      ? null
-                      : () => unawaited(_toggleVoiceControl()),
-                ),
-              _buildTerminalFontControls(theme),
-              _terminalPanelIconButton(
-                icon: Icon(
-                  _nativeKeyboardLocked ? Icons.keyboard_hide : Icons.keyboard,
-                ),
-                tooltip: _nativeKeyboardLocked
-                    ? 'Native keyboard locked off'
-                    : 'Native keyboard allowed',
-                selected: _nativeKeyboardLocked,
-                onPressed: () =>
-                    _setNativeKeyboardLocked(!_nativeKeyboardLocked),
-              ),
-              _terminalPanelIconButton(
-                icon: const Icon(Icons.key),
-                tooltip: 'Sign in from this phone',
-                onPressed: _connected ? _signInFromPhone : null,
-              ),
-              _terminalPanelIconButton(
-                icon: Icon(
-                  widget.fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
-                ),
-                tooltip: widget.fullscreen
-                    ? 'Show DevOTA tabs'
-                    : 'Hide DevOTA tabs',
-                selected: widget.fullscreen,
-                onPressed: widget.onFullscreenChanged == null
-                    ? null
-                    : () => widget.onFullscreenChanged!(!widget.fullscreen),
-              ),
-              _terminalPanelIconButton(
-                icon: const Icon(Icons.settings),
-                tooltip: 'SSH settings',
-                onPressed: _showConnectionSheet,
-              ),
-            ],
+                ],
+              );
+            },
           ),
         ),
       ),
@@ -4441,19 +4473,24 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     final items = <({_TmuxButton button, int index})>[
       for (var i = 0; i < buttons.length; i++) (button: buttons[i], index: i),
     ];
-    // An arrangement the user dragged into place wins; a button it does not
-    // name yet (added in a later version) follows in catalog order: New,
-    // Next, Prev, windows 0-5, then the other tmux commands.
-    int arranged(String id) {
-      final at = _tmuxOrder.indexOf(id);
-      return at < 0 ? _tmuxOrder.length : at;
+    // An arrangement the user dragged into place wins. A button it does not
+    // name yet (added in a later version, like the window buttons 0-5) goes
+    // right after its nearest catalog predecessor that is placed, so it lands
+    // beside its neighbours instead of at the end.
+    double arranged(int index) {
+      final at = _tmuxOrder.indexOf(items[index].button.id);
+      if (at >= 0) return at.toDouble();
+      for (var before = index - 1; before >= 0; before--) {
+        final anchor = _tmuxOrder.indexOf(items[before].button.id);
+        if (anchor >= 0) return anchor + (index - before) / 1000;
+      }
+      return -1 + index / 1000;
     }
 
-    items.sort((a, b) {
-      final placed = arranged(a.button.id).compareTo(arranged(b.button.id));
-      if (placed != 0) return placed;
-      return a.index.compareTo(b.index);
-    });
+    final keys = [for (var i = 0; i < items.length; i++) arranged(i)];
+    final order = [for (var i = 0; i < items.length; i++) i]
+      ..sort((a, b) => keys[a].compareTo(keys[b]));
+    items.setAll(0, [for (final i in order) items[i]]);
     final shown = [for (final item in items) item.button.id];
 
     // Hold a button to pick it up, then drag it to where it belongs; a flick
