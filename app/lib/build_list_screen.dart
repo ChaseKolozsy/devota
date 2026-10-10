@@ -1203,7 +1203,7 @@ class _BuildListScreenState extends State<BuildListScreen>
   Future<void> _loadGithubSettings() async {
     final prefs = await SharedPreferences.getInstance();
     _githubRepoController.text =
-        prefs.getString('github_repo') ?? 'ChaseKolozsy/dev-ota';
+        prefs.getString('github_repo') ?? 'ChaseKolozsy/devota';
     _githubWorkflowController.text =
         prefs.getString('github_workflow') ?? 'android.yml';
     _githubRefController.text = prefs.getString('github_ref') ?? 'main';
