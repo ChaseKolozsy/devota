@@ -1,0 +1,244 @@
+import 'dart:convert';
+
+import 'package:dio/dio.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'voice_input_service.dart';
+
+class BackupService {
+  static const _stringListPreferenceKeys = ['commands', 'issues', 'servers'];
+  static const _stringPreferenceKeys = [
+    'active_server',
+    'agent_ws_url',
+    'agent_pair_token',
+    'agent_profiles_json',
+    'agent_selected_profile_id',
+    'ssh_host',
+    'ssh_port',
+    'ssh_username',
+    'ssh_private_key_name',
+    'ssh_profiles_json',
+    'ssh_selected_profile_id',
+    'command_usage_counts_json',
+    'terminal_key_usage_counts_json',
+    'terminal_tmux_order_json',
+    'github_repo',
+    'github_workflow',
+    'github_ref',
+    'github_artifact',
+    'last_used_build_app_id',
+    'last_used_build_path',
+    'macros_json',
+    'macro_usage_counts_json',
+    'macros_by_profile_json',
+    'macros_profile_id',
+    'terminal_pad_config_json',
+  ];
+  static const _boolPreferenceKeys = [
+    'agent_whole_device',
+    'computer_profiles_migrated',
+    'ssh_use_private_key',
+    'terminal_fullscreen',
+    'terminal_native_keyboard_locked',
+    'terminal_tools_visible',
+  ];
+  static const _doublePreferenceKeys = ['terminal_font_size'];
+  static const _serverPath = '/backup/profile';
+
+  static final FlutterSecureStorage _storage = const FlutterSecureStorage();
+
+  static bool isExportableSecret(String key) {
+    return key == VoiceInputService.apiKeyStorageKey ||
+        key.startsWith('ssh_profile:') ||
+        key.startsWith('ssh_terminal_generated_');
+  }
+
+  static Future<Map<String, dynamic>> buildBackup({
+    bool includeSecrets = true,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    final shared = <String, Object?>{};
+
+    for (final key in _stringListPreferenceKeys) {
+      final value = prefs.getStringList(key);
+      if (value != null) shared[key] = value;
+    }
+    for (final key in _stringPreferenceKeys) {
+      final value = prefs.getString(key);
+      if (value != null) shared[key] = value;
+    }
+    for (final key in _boolPreferenceKeys) {
+      final value = prefs.getBool(key);
+      if (value != null) shared[key] = value;
+    }
+    for (final key in _doublePreferenceKeys) {
+      final value = prefs.getDouble(key);
+      if (value != null) shared[key] = value;
+    }
+
+    final secure = <String, String>{};
+    if (includeSecrets) {
+      final values = await _storage.readAll();
+      for (final entry in values.entries) {
+        if (isExportableSecret(entry.key)) {
+          secure[entry.key] = entry.value;
+        }
+      }
+    }
+
+    return {
+      'format': 'devota-backup',
+      'version': 1,
+      'exportedAt': DateTime.now().toUtc().toIso8601String(),
+      'sharedPreferences': shared,
+      'secureStorage': secure,
+    };
+  }
+
+  static Future<void> importBackup(
+    Map<String, dynamic> backup, {
+    bool includeSecrets = true,
+  }) async {
+    if (backup['format'] != 'devota-backup') {
+      throw const FormatException('Not a DevOTA backup.');
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    final shared = backup['sharedPreferences'];
+    if (shared is Map) {
+      // Older exports need another merge into the unified computer model.
+      if (!shared.containsKey('computer_profiles_migrated') &&
+          [
+            'ssh_profiles_json',
+            'ssh_host',
+            'agent_profiles_json',
+            'agent_ws_url',
+            'servers',
+          ].any(shared.containsKey)) {
+        await prefs.remove('computer_profiles_migrated');
+        if (shared.containsKey('ssh_host') &&
+            !shared.containsKey('ssh_profiles_json')) {
+          await prefs.remove('ssh_profiles_json');
+          await prefs.remove('ssh_selected_profile_id');
+        }
+      }
+      for (final entry in shared.entries) {
+        final key = entry.key.toString();
+        final value = entry.value;
+        if (_stringListPreferenceKeys.contains(key) && value is List) {
+          await prefs.setStringList(
+            key,
+            value.map((item) => item.toString()).toList(),
+          );
+        } else if (_stringPreferenceKeys.contains(key) && value != null) {
+          await prefs.setString(key, value.toString());
+        } else if (_boolPreferenceKeys.contains(key) && value is bool) {
+          await prefs.setBool(key, value);
+        } else if (_doublePreferenceKeys.contains(key) && value is num) {
+          await prefs.setDouble(key, value.toDouble());
+        }
+      }
+    }
+
+    if (includeSecrets) {
+      final secure = backup['secureStorage'];
+      if (secure is Map) {
+        for (final entry in secure.entries) {
+          final key = entry.key.toString();
+          final value = entry.value;
+          if (value is String && isExportableSecret(key)) {
+            await _storage.write(key: key, value: value);
+          }
+        }
+      }
+    }
+  }
+
+  static Future<void> importBackupText(
+    String text, {
+    bool includeSecrets = true,
+  }) async {
+    final decoded = json.decode(text);
+    if (decoded is! Map) {
+      throw const FormatException('Backup must be a JSON object.');
+    }
+    await importBackup(
+      Map<String, dynamic>.from(decoded),
+      includeSecrets: includeSecrets,
+    );
+  }
+
+  static String prettyJson(Map<String, dynamic> value) {
+    return const JsonEncoder.withIndent('  ').convert(value);
+  }
+
+  static String _baseUrl(String serverUrl) {
+    return serverUrl.trim().replaceAll(RegExp(r'/+$'), '');
+  }
+
+  static Future<bool> saveToServer(
+    Dio dio,
+    String serverUrl, {
+    bool includeSecrets = true,
+  }) async {
+    final base = _baseUrl(serverUrl);
+    if (base.isEmpty) return false;
+    final backup = await buildBackup(includeSecrets: includeSecrets);
+    final resp = await dio.post(
+      '$base$_serverPath',
+      data: backup,
+      options: Options(
+        headers: {'Content-Type': 'application/json'},
+        sendTimeout: const Duration(seconds: 8),
+        receiveTimeout: const Duration(seconds: 8),
+      ),
+    );
+    return resp.statusCode == 200;
+  }
+
+  static Future<bool> restoreFromServer(
+    Dio dio,
+    String serverUrl, {
+    bool includeSecrets = true,
+  }) async {
+    final base = _baseUrl(serverUrl);
+    if (base.isEmpty) return false;
+    try {
+      final resp = await dio.get(
+        '$base$_serverPath',
+        options: Options(
+          sendTimeout: const Duration(seconds: 8),
+          receiveTimeout: const Duration(seconds: 8),
+        ),
+      );
+      if (resp.statusCode != 200 || resp.data is! Map) return false;
+      await importBackup(
+        Map<String, dynamic>.from(resp.data as Map),
+        includeSecrets: includeSecrets,
+      );
+      return true;
+    } on DioException catch (e) {
+      if (e.response?.statusCode == 404) return false;
+      rethrow;
+    }
+  }
+
+  static Future<bool> hasLocalRestorableData() async {
+    final prefs = await SharedPreferences.getInstance();
+    for (final key in _stringListPreferenceKeys) {
+      final value = prefs.getStringList(key);
+      if (key != 'servers' && value != null && value.isNotEmpty) return true;
+    }
+    for (final key in _stringPreferenceKeys) {
+      if (key == 'active_server') continue;
+      final value = prefs.getString(key);
+      if (value != null && value.trim().isNotEmpty) return true;
+    }
+    for (final key in _boolPreferenceKeys) {
+      if (prefs.getBool(key) != null) return true;
+    }
+    final secure = await _storage.readAll();
+    return secure.keys.any(isExportableSecret);
+  }
+}

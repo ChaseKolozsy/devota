@@ -1,0 +1,16 @@
+# Copy to devota.yaml (gitignored) and list the apps this machine builds.
+version: 1
+roots:
+  devota: .
+apps:
+  - id: devota
+    root: devota
+    label: DevOTA
+    packageName: io.github.chasekolozsy.devota
+    buildDirs:
+      - app/dist/public
+    build:
+      workingDir: app
+      commands:
+        debug: ../scripts/build/devota-public-debug.sh
+        release: ../scripts/build/devota-public-release.sh

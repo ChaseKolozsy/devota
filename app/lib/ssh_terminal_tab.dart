@@ -1,0 +1,4620 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:dartssh2/dartssh2.dart';
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:pinenacl/ed25519.dart' as ed25519;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:xterm/xterm.dart';
+
+import 'backup_service.dart';
+import 'background_session_service.dart';
+import 'macro_reorder.dart';
+import 'macro_sync_service.dart';
+import 'openai_key_dialog.dart';
+import 'terminal_macro.dart';
+import 'terminal_submission.dart';
+import 'terminal_watch.dart';
+import 'ssh_watch_transport.dart';
+import 'terminal_watch_screen.dart';
+import 'terminal_host_route.dart';
+import 'terminal_notification_bridge.dart';
+import 'terminal_pad_key.dart';
+import 'terminal_profiles.dart';
+import 'voice_input_service.dart';
+import 'voice/voice_commands.dart';
+import 'voice/voice_control.dart';
+
+/// A foldable terminal tool bar (tmux / macros / cmds). When folded its content
+/// is hidden and its label stacks into the next visible bar's row.
+class _ToolBar {
+  const _ToolBar({
+    required this.id,
+    required this.label,
+    required this.background,
+    required this.enabled,
+    required this.folded,
+    required this.onToggle,
+    required this.onToggleFold,
+    required this.buildContent,
+  });
+
+  final String id;
+  final String label;
+  final Color background;
+  final bool enabled;
+  final bool folded;
+  final VoidCallback onToggle;
+  final VoidCallback onToggleFold;
+  final Widget Function() buildContent;
+}
+
+/// One button of the tmux row. The row and voice control are both built from
+/// this list, so a spoken "next window" runs exactly what tapping Next does.
+class _TmuxButton {
+  const _TmuxButton(this.id, this.label, this.tooltip, this.action);
+
+  final String id;
+  final String label;
+  final String tooltip;
+  final VoidCallback action;
+}
+
+/// One arrow of the control pad's arrow cluster.
+class _ArrowKey {
+  const _ArrowKey(this.id, this.icon, this.tooltip, this.sequence, this.align);
+
+  final String id;
+  final IconData icon;
+  final String tooltip;
+  final String sequence;
+  final Alignment align;
+}
+
+/// Test seams for the Terminal tab. Production code never sets these.
+@visibleForTesting
+class SshTerminalTestHooks {
+  const SshTerminalTestHooks({
+    this.sessionSink,
+    this.requestMicrophone,
+    this.voiceInput,
+  });
+
+  /// Stands in for a connected SSH session: the tab counts as connected and
+  /// every byte it would write to the session is passed here instead.
+  final void Function(String data)? sessionSink;
+
+  /// Replaces the record-button service for deterministic error-path tests.
+  final VoiceInputService? voiceInput;
+
+  /// Replaces the microphone permission request.
+  final Future<bool> Function()? requestMicrophone;
+}
+
+/// Editor for a custom control-pad key. A dedicated StatefulWidget (rather than
+/// a StatefulBuilder inside a helper) so its text controllers live and die with
+/// the dialog's own element — disposing them right after `await showDialog`
+/// tears them down mid-exit-animation and cascades into framework assertions.
+class _CustomPadKeyDialog extends StatefulWidget {
+  const _CustomPadKeyDialog({this.existing, required this.newId});
+
+  final TerminalPadKey? existing;
+  final String newId;
+
+  static Future<({TerminalPadKey? saved, bool deleted})?> show(
+    BuildContext context, {
+    TerminalPadKey? existing,
+    required String newId,
+  }) {
+    return showDialog<({TerminalPadKey? saved, bool deleted})>(
+      context: context,
+      builder: (_) => _CustomPadKeyDialog(existing: existing, newId: newId),
+    );
+  }
+
+  @override
+  State<_CustomPadKeyDialog> createState() => _CustomPadKeyDialogState();
+}
+
+class _CustomPadKeyDialogState extends State<_CustomPadKeyDialog> {
+  late final TextEditingController _abbrev;
+  late final TextEditingController _name;
+  late final TextEditingController _spec;
+
+  @override
+  void initState() {
+    super.initState();
+    final existing = widget.existing;
+    _abbrev = TextEditingController(text: existing?.abbreviation ?? '');
+    _name = TextEditingController(text: existing?.name ?? '');
+    _spec = TextEditingController(
+      text: (existing?.spec.isNotEmpty ?? false)
+          ? existing!.spec
+          : (existing?.sequence ?? ''),
+    );
+  }
+
+  @override
+  void dispose() {
+    _abbrev.dispose();
+    _name.dispose();
+    _spec.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final existing = widget.existing;
+    final abbrev = _abbrev.text.trim();
+    final tooLong = abbrev.length >= 5;
+    final specText = _spec.text.trim();
+    final specResult = specText.isEmpty ? null : resolveKeySpec(specText);
+    final specValid = specResult?.ok ?? false;
+    final canSave = abbrev.isNotEmpty && specValid;
+    return AlertDialog(
+      title: Text(existing == null ? 'New button' : 'Edit button'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _abbrev,
+              maxLength: 8,
+              decoration: InputDecoration(
+                labelText: 'Abbreviation (shown on the button)',
+                counterText: '',
+                helperText: tooLong
+                    ? 'Long abbreviations widen the button — '
+                          '$kRecommendedAbbrevMax characters or fewer is '
+                          'recommended'
+                    : 'Recommended: $kRecommendedAbbrevMax characters or fewer',
+                helperMaxLines: 2,
+                helperStyle: tooLong
+                    ? TextStyle(color: theme.colorScheme.error)
+                    : null,
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            TextField(
+              controller: _name,
+              decoration: const InputDecoration(labelText: 'Name (tooltip)'),
+            ),
+            TextField(
+              controller: _spec,
+              decoration: const InputDecoration(
+                labelText: 'Key(s) to send',
+                helperText: 'e.g. Ctrl-C · Home · Ctrl-End · F5 · Shift-Tab',
+                helperMaxLines: 2,
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 6),
+            if (specResult != null)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(
+                      specValid
+                          ? Icons.check_circle_outline
+                          : Icons.error_outline,
+                      size: 16,
+                      color: specValid
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.error,
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        specValid
+                            ? 'Sends: ${specResult.description}'
+                            : specResult.error!,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: specValid
+                              ? theme.colorScheme.onSurfaceVariant
+                              : theme.colorScheme.error,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            const SizedBox(height: 4),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Wrap(
+                spacing: 6,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  for (final example in const [
+                    'Ctrl-C',
+                    'Ctrl-Z',
+                    'Home',
+                    'Ctrl-End',
+                  ])
+                    ActionChip(
+                      label: Text(example),
+                      onPressed: () {
+                        _spec.text = example;
+                        setState(() {});
+                      },
+                    ),
+                  TextButton.icon(
+                    icon: const Icon(Icons.help_outline, size: 18),
+                    label: const Text('Legend'),
+                    onPressed: () => showTerminalKeyLegend(context),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        if (existing != null)
+          TextButton(
+            onPressed: () =>
+                Navigator.pop(context, (saved: null, deleted: true)),
+            child: Text(
+              'Delete',
+              style: TextStyle(color: theme.colorScheme.error),
+            ),
+          ),
+        TextButton(
+          onPressed: () => Navigator.pop(context, null),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: canSave
+              ? () {
+                  final name = _name.text.trim();
+                  Navigator.pop(context, (
+                    saved: TerminalPadKey(
+                      id: existing?.id ?? widget.newId,
+                      abbreviation: abbrev,
+                      name: name.isEmpty ? abbrev : name,
+                      sequence: specResult!.sequence!,
+                      spec: specText,
+                    ),
+                    deleted: false,
+                  ));
+                }
+              : null,
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
+
+/// Shows the reference of valid key names, modifiers, and examples that the
+/// custom-key editor accepts.
+Future<void> showTerminalKeyLegend(BuildContext context) {
+  final theme = Theme.of(context);
+  Widget section(String title, String body) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: theme.textTheme.titleSmall),
+          const SizedBox(height: 3),
+          Text(
+            body,
+            style: theme.textTheme.bodySmall?.copyWith(
+              fontFamily: 'monospace',
+              height: 1.45,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  return showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Key reference'),
+      content: SizedBox(
+        width: 360,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              section(
+                'Modifiers',
+                'Ctrl-   (also C-, ^)\n'
+                    'Alt-    (also M-)\n'
+                    'Shift-  (also S-)\n'
+                    'Combine: Ctrl-Shift-End',
+              ),
+              section(
+                'Named keys',
+                'Tab  Esc  Enter  Backspace\n'
+                    'Space  Del  Ins\n'
+                    'Home  End  PgUp  PgDn\n'
+                    'Up  Down  Left  Right\n'
+                    'F1 … F12',
+              ),
+              section(
+                'Letters & symbols',
+                'Any letter or digit, e.g. Ctrl-C, Alt-x.\n'
+                    r'Ctrl also works with  @ [ \ ] ^ _ ?',
+              ),
+              section(
+                'Examples',
+                'Ctrl-C    interrupt\n'
+                    'Ctrl-Z    suspend\n'
+                    'Ctrl-End  jump to end\n'
+                    'Shift-Tab back-tab\n'
+                    'F5        refresh',
+              ),
+              section(
+                'Advanced',
+                'Literal text:  "ls -la"\n'
+                    r'Raw bytes:     \xNN  \t  \r  \e',
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('Close'),
+        ),
+      ],
+    ),
+  );
+}
+
+class SshTerminalTab extends StatefulWidget {
+  const SshTerminalTab({
+    super.key,
+    required this.dio,
+    required this.serverUrl,
+    this.quickCommands = const [],
+    this.quickMacros = const [],
+    this.notificationMacros = const [],
+    this.macroController,
+    this.fullscreen = false,
+    this.onFullscreenChanged,
+    this.onCommandUsed,
+    this.onMacroUsed,
+    this.onMacroReorder,
+    this.onZeroTierRecovery,
+    this.testHooks,
+    this.profileId,
+    this.profiles,
+    this.active = true,
+    this.onSelectProfile,
+    this.onConnectionChanged,
+    this.onProfilesChanged,
+    this.sessionSelector,
+  });
+
+  final String? profileId;
+  final TerminalProfiles? profiles;
+  final bool active;
+  final Future<void> Function(String id, TerminalProfile? create)?
+  onSelectProfile;
+  final ValueChanged<bool>? onConnectionChanged;
+  final VoidCallback? onProfilesChanged;
+  final Widget? sessionSelector;
+  final Dio dio;
+  final String serverUrl;
+  final List<String> quickCommands;
+  final List<TerminalMacro> quickMacros;
+  final List<TerminalMacro> notificationMacros;
+  final TerminalMacroController? macroController;
+  final bool fullscreen;
+  final ValueChanged<bool>? onFullscreenChanged;
+  final ValueChanged<String>? onCommandUsed;
+  final ValueChanged<TerminalMacro>? onMacroUsed;
+  final Future<bool> Function()? onZeroTierRecovery;
+
+  /// Called when a macro button is held and dragged to a new slot in the macro
+  /// bar, with its old and new index in [quickMacros].
+  final void Function(int fromIndex, int toIndex)? onMacroReorder;
+
+  @visibleForTesting
+  final SshTerminalTestHooks? testHooks;
+
+  @override
+  State<SshTerminalTab> createState() => _SshTerminalTabState();
+}
+
+class _SshTerminalTabState extends State<SshTerminalTab>
+    with WidgetsBindingObserver, AutomaticKeepAliveClientMixin<SshTerminalTab>
+    implements VoiceSurface {
+  final _storage = const FlutterSecureStorage();
+  late final _voice =
+      widget.testHooks?.voiceInput ?? VoiceInputService(widget.dio);
+  late final _terminal = Terminal(maxLines: 10000);
+  final _terminalController = TerminalController(
+    pointerInputs: const PointerInputs({PointerInput.tap, PointerInput.scroll}),
+  );
+  final _terminalFocusNode = FocusNode();
+  final _terminalScrollController = ScrollController();
+  final _composerFocusNode = FocusNode();
+
+  final _hostController = TextEditingController();
+  final _portController = TextEditingController(text: '22');
+  final _usernameController = TextEditingController();
+  final _passwordController = TextEditingController();
+  final _passphraseController = TextEditingController();
+  final _composerController = TextEditingController();
+
+  TerminalProfiles? _profiles;
+  Future<void>? _profileLoad;
+  bool _profileBusy = false;
+  bool _usePrivateKey = false;
+  bool _busy = false;
+  bool _connected = false;
+  bool _recording = false;
+  bool _transcribing = false;
+  bool _tmuxScrollMode = false;
+  bool _terminalToolsVisible = true;
+  bool _nativeKeyboardLocked = false;
+  bool _macroRunning = false;
+  final _watch = TerminalWatchController();
+  TerminalHostRoute _watchRoute = const TerminalHostRoute();
+  late final _voiceSession = VoiceControlSession(
+    surface: this,
+    active: widget.active,
+    requestMicrophone:
+        widget.testHooks?.requestMicrophone ?? _voice.requestMicrophone,
+  );
+  late final _notificationBridge = TerminalNotificationBridge(
+    _watch,
+    active: widget.active,
+    onSessionAction: _onNotificationSessionAction,
+    label: _notificationLabel,
+  );
+
+  /// The computer's name on its window cards, so two computers' cards differ.
+  String _notificationLabel() {
+    final profiles = _profiles;
+    if (profiles != null) {
+      final id = widget.profileId ?? profiles.selectedId;
+      for (final profile in profiles.profiles) {
+        if (profile.id == id && profile.name.trim().isNotEmpty) {
+          return profile.name.trim();
+        }
+      }
+    }
+    return _host;
+  }
+
+  bool get _inputLocked => _macroRunning || _watch.busy;
+  String? _macroRunningName;
+  int _macroStepIndex = 0;
+  int _macroStepCount = 0;
+  bool _macroStopRequested = false;
+  bool _sessionBarEnabled = true;
+  bool _sessionBarFolded = false;
+  bool _tmuxBarEnabled = true;
+  bool _macroBarEnabled = true;
+  bool _commandBarEnabled = true;
+  bool _tmuxBarFolded = false;
+  bool _macroBarFolded = false;
+  bool _commandBarFolded = false;
+  TerminalPadConfig _padConfig = TerminalPadConfig.defaults();
+  double _tmuxScrollRemainder = 0;
+  double _terminalMouseScrollRemainder = 0;
+  Offset? _terminalPressDownPosition;
+  bool _terminalPressMoved = false;
+  double _terminalFontSize = _terminalDefaultFontSize;
+  Map<String, int> _terminalKeyUseCounts = {};
+
+  /// The tmux row as the user arranged it (button ids). Empty until the first
+  /// drag; until then the row is in catalog order.
+  List<String> _tmuxOrder = const [];
+  String? _status;
+  String? _privateKeyName;
+  String? _generatedPublicKey;
+
+  SSHClient? _client;
+  SSHSession? _session;
+  StreamSubscription<String>? _stdoutSub;
+  StreamSubscription<String>? _stderrSub;
+  Timer? _backupDebounce;
+
+  /// True between a user-initiated Connect and a user-initiated Disconnect.
+  /// Anything that breaks the session in between is treated as a drop worth
+  /// recovering from, not as the user leaving.
+  bool _wantConnected = false;
+  bool _keepAliveInBackground = true;
+  bool _batteryOptimizationExempt = true;
+  Timer? _reconnectTimer;
+  int _reconnectAttempts = 0;
+  bool _sessionNotificationStarted = false;
+  bool _repairingNetwork = false;
+  bool _disposing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _watch.resolveMacro = (macro) =>
+        MacroSyncService.resolveForRun(widget.dio, widget.serverUrl, macro);
+    _terminal.write('DevOTA SSH terminal\r\n');
+    _terminal.onOutput = (data) {
+      if (!_watch.busy) _writeSessionBytes(data);
+    };
+    if (widget.testHooks?.sessionSink != null) _connected = true;
+    _terminal.onResize = (width, height, pixelWidth, pixelHeight) {
+      _session?.resizeTerminal(width, height, pixelWidth, pixelHeight);
+    };
+    _profileLoad = _loadProfile();
+    _loadTerminalKeyUsage();
+    _loadTmuxOrder();
+    _loadTerminalToolVisibility();
+    _loadNativeKeyboardLock();
+    _loadTerminalFontSize();
+    _loadTerminalPadConfig();
+    _loadBackgroundKeepAlive();
+    _loadVoiceQuietBeeps();
+    _loadMacroDurations();
+    _voiceSession.addListener(_onVoiceChanged);
+    _attachMacroController();
+    _watch.addListener(_onWatchChanged);
+    _notificationBridge.publish();
+  }
+
+  @override
+  void dispose() {
+    _disposing = true;
+    _voiceSession.removeListener(_onVoiceChanged);
+    _voiceSession.dispose();
+    _watch.removeListener(_onWatchChanged);
+    _notificationBridge.dispose();
+    _watch.dispose();
+    widget.macroController?.detach(owner: this);
+    WidgetsBinding.instance.removeObserver(this);
+    _reconnectTimer?.cancel();
+    _sessionNotificationStarted = false;
+    _disconnect();
+    _hostController.dispose();
+    _portController.dispose();
+    _usernameController.dispose();
+    _passwordController.dispose();
+    _passphraseController.dispose();
+    _composerController.dispose();
+    _stdoutSub?.cancel();
+    _stderrSub?.cancel();
+    _backupDebounce?.cancel();
+    _terminalFocusNode.dispose();
+    _terminalScrollController.dispose();
+    _composerFocusNode.dispose();
+    _voice.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant SshTerminalTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.profiles != null && !identical(widget.profiles, _profiles)) {
+      _profiles = widget.profiles;
+    }
+    if (oldWidget.active != widget.active) {
+      _voiceSession.setActive(widget.active);
+      _notificationBridge.setActive(widget.active);
+      if (!widget.active) {
+        _terminalFocusNode.unfocus();
+        _composerFocusNode.unfocus();
+      } else {
+        // Another computer's terminal may have rearranged the tmux row.
+        unawaited(_loadTmuxOrder());
+      }
+      unawaited(_syncBackgroundSession());
+    }
+    if (oldWidget.macroController != widget.macroController) {
+      oldWidget.macroController?.detach(owner: this);
+      _attachMacroController();
+    }
+    _watch.updateMacros(widget.notificationMacros);
+    _notificationBridge.publish();
+  }
+
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed || !mounted) return;
+    // Coming back is the one moment we know the user is watching, so retry
+    // immediately with a clean slate instead of waiting out the backoff.
+    if (_wantConnected && !_connected && !_busy) {
+      _reconnectAttempts = 0;
+      _reconnectTimer?.cancel();
+      unawaited(_connect(auto: true));
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (widget.active && _connected) _terminalFocusNode.requestFocus();
+    });
+  }
+
+  String get _host => _hostController.text.trim();
+  int get _port => int.tryParse(_portController.text.trim()) ?? 22;
+  String get _username => _usernameController.text.trim();
+  String get _profilePrefix =>
+      'ssh_profile:${_host.isEmpty ? 'default' : _host}:$_port';
+  String get _hostKeyStorageKey => '$_profilePrefix:host_key';
+  TerminalProfile get _currentProfile => _profiles!.profiles.firstWhere(
+    (profile) => profile.id == (widget.profileId ?? _profiles!.selectedId),
+  );
+  String get _privateKeyStorageKey => _currentProfile.secretKey('private_key');
+  String get _generatedPrivateKeyStorageKey =>
+      'ssh_terminal_generated_private_key';
+  String get _generatedPublicKeyStorageKey =>
+      'ssh_terminal_generated_public_key';
+  static const _terminalKeyUsageCountsKey = 'terminal_key_usage_counts_json';
+  static const _tmuxOrderKey = 'terminal_tmux_order_json';
+  static const _terminalToolsVisibleKey = 'terminal_tools_visible';
+  static const _nativeKeyboardLockedKey = 'terminal_native_keyboard_locked';
+  static const _terminalFontSizeKey = 'terminal_font_size';
+  static const _terminalPadConfigKey = 'terminal_pad_config_json';
+  static const _backgroundKeepAliveKey = 'terminal_background_keepalive';
+  static const _backgroundBatteryPromptKey = 'terminal_background_battery_ask';
+  static const _voiceQuietBeepsKey = 'terminal_voice_quiet_beeps';
+  static const _terminalDefaultFontSize = 13.0;
+  static const _terminalMinFontSize = 8.0;
+  static const _terminalMaxFontSize = 22.0;
+  static const _tmuxScrollPixelsPerLine = 18.0;
+  static const _tmuxScrollMaxLinesPerGesture = 12;
+
+  void _attachMacroController() {
+    widget.macroController?.attach(
+      owner: this,
+      runner: _runMacro,
+      canRun: () => _connected && !_inputLocked,
+      isRunning: () => _inputLocked,
+      progress: _macroProgress,
+      stop: _requestMacroStop,
+    );
+  }
+
+  MacroRunProgress? _macroProgress() {
+    if (_watch.busy) {
+      return MacroRunProgress(
+        macroName: _watch.progress ?? 'Notification macro',
+        stepIndex: 0,
+        stepCount: 1,
+        stopping: false,
+      );
+    }
+    if (!_macroRunning) return null;
+    return MacroRunProgress(
+      macroName: _macroRunningName ?? 'Macro',
+      stepIndex: _macroStepIndex,
+      stepCount: _macroStepCount,
+      stopping: _macroStopRequested,
+    );
+  }
+
+  /// The escape hatch that makes locking the controls fair: instead of mashing
+  /// buttons when a macro looks stuck, the user gets one deliberate Stop.
+  void _requestMacroStop() {
+    if (_watch.busy) {
+      _watch.stop();
+      return;
+    }
+    if (!_macroRunning || _macroStopRequested) return;
+    if (mounted) {
+      setState(() {
+        _macroStopRequested = true;
+        _status = 'Stopping macro...';
+      });
+    } else {
+      _macroStopRequested = true;
+    }
+    _notifyMacroController();
+  }
+
+  void _notifyMacroController() {
+    if (_disposing || !mounted) return;
+    _watch.externalBusy = _macroRunning;
+    _notificationBridge.publish();
+    widget.macroController?.notifyStateChanged();
+  }
+
+  void _onWatchChanged() {
+    if (!mounted) return;
+    setState(() {});
+    widget.macroController?.notifyStateChanged();
+  }
+
+  String get _watchPreferencesKey => 'terminal_watch:$_username@$_host:$_port';
+
+  static const _macroDurationsKey = 'terminal_macro_durations';
+
+  /// Per-macro completion times, shared across hosts because macro IDs are.
+  Future<void> _loadMacroDurations() async {
+    final prefs = await SharedPreferences.getInstance();
+    try {
+      final raw = prefs.getString(_macroDurationsKey);
+      if (raw != null) {
+        _watch.macroDurations = {
+          for (final entry in (jsonDecode(raw) as Map).entries)
+            entry.key as String: (entry.value as List).cast<int>(),
+        };
+      }
+    } catch (_) {
+      // A corrupt record only loses averages; they rebuild from new runs.
+    }
+    _watch.onDurationsChanged = (durations) =>
+        unawaited(prefs.setString(_macroDurationsKey, jsonEncode(durations)));
+  }
+
+  Future<void> _connectWatch(SSHClient client) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted || !identical(_client, client)) return;
+    final raw = prefs.getString(_watchPreferencesKey);
+    var bindings = <TerminalWatchBinding>[];
+    var quiet = 10;
+    _watchRoute = const TerminalHostRoute();
+    if (raw != null) {
+      try {
+        final saved = jsonDecode(raw) as Map;
+        bindings = (saved['bindings'] as List)
+            .take(3)
+            .map(
+              (b) => TerminalWatchBinding.fromJson(
+                Map<String, dynamic>.from(b as Map),
+              ),
+            )
+            .toList();
+        quiet = (saved['quiet'] as int).clamp(5, 30);
+        _watch.reviewEnabled = saved['review'] != false;
+        _watch.autoRunEnabled = saved['autoRun'] != false;
+        if (saved['route'] is Map) {
+          _watchRoute = TerminalHostRoute.fromJson(
+            Map<String, dynamic>.from(saved['route'] as Map),
+          );
+          _watchRoute.validate();
+        }
+      } catch (_) {
+        bindings = [];
+        _watchRoute = const TerminalHostRoute();
+      }
+    }
+    // A disconnected run must unwind before replacing its binding set.
+    while (_watch.busy) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      if (!mounted || !identical(_client, client)) return;
+    }
+    _watch.quietPeriod = Duration(seconds: quiet);
+    _watch.configure(bindings, widget.notificationMacros);
+    _watch.connect(
+      sshWatchTransport(
+        client,
+        isCurrent: () => identical(_client, client) && _connected,
+        router: sshHostRouter(
+          client,
+          isCurrent: () => identical(_client, client) && _connected,
+          route: _watchRoute,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showNotificationControls() async {
+    if (!_connected || _inputLocked) return;
+    final client = _client!;
+    // Discover draft routes without moving any already-bound notification.
+    final router = sshHostRouter(
+      client,
+      isCurrent: () => identical(_client, client) && _connected,
+      route: _watchRoute,
+    );
+    final transport = sshWatchTransport(client, router: router);
+    try {
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute(
+          builder: (_) => TerminalWatchScreen(
+            watch: _watch,
+            loadPanes: transport.panes,
+            hostRouter: router,
+            deliveryStatus: _notificationBridge.deliveryStatus,
+            macros: widget.notificationMacros
+                .where((m) => !m.isDeviceMacro)
+                .toList(),
+            onSave: (bindings, quiet, review, autoRun) async {
+              if (!identical(_client, client) || !_connected) {
+                throw StateError(
+                  'SSH disconnected; reconnect and reopen setup',
+                );
+              }
+              if (!_keepAliveInBackground) {
+                await _setKeepAliveInBackground(true);
+              }
+              _watch.quietPeriod = Duration(seconds: quiet);
+              if (_inputLocked) {
+                throw StateError('Wait for the running macro before saving');
+              }
+              _watch.reviewEnabled = review;
+              _watch.autoRunEnabled = autoRun;
+              _watchRoute = router.route;
+              _watch.configure(bindings, widget.notificationMacros);
+              _watch.connect(transport);
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString(
+                _watchPreferencesKey,
+                jsonEncode({
+                  'bindings': bindings.map((b) => b.toJson()).toList(),
+                  'quiet': quiet,
+                  'review': review,
+                  'autoRun': autoRun,
+                  'route': _watchRoute.toJson(),
+                }),
+              );
+              await _notificationBridge.verifyDelivery();
+            },
+          ),
+        ),
+      );
+    } catch (e) {
+      if (mounted) setState(() => _status = 'Notification controls: $e');
+    }
+  }
+
+  Future<void> _loadTerminalToolVisibility() async {
+    final prefs = await SharedPreferences.getInstance();
+    final visible = prefs.getBool(_terminalToolsVisibleKey) ?? true;
+    if (mounted) setState(() => _terminalToolsVisible = visible);
+  }
+
+  Future<void> _saveTerminalToolVisibility() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_terminalToolsVisibleKey, _terminalToolsVisible);
+    _scheduleServerBackup();
+  }
+
+  void _toggleTerminalTools() {
+    setState(() => _terminalToolsVisible = !_terminalToolsVisible);
+    unawaited(_saveTerminalToolVisibility());
+  }
+
+  Future<void> _loadNativeKeyboardLock() async {
+    final prefs = await SharedPreferences.getInstance();
+    final locked = prefs.getBool(_nativeKeyboardLockedKey) ?? false;
+    if (mounted) setState(() => _nativeKeyboardLocked = locked);
+  }
+
+  Future<void> _saveNativeKeyboardLock() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_nativeKeyboardLockedKey, _nativeKeyboardLocked);
+    _scheduleServerBackup();
+  }
+
+  void _setNativeKeyboardLocked(bool locked) {
+    if (_nativeKeyboardLocked == locked) return;
+    setState(() {
+      _nativeKeyboardLocked = locked;
+      _status = locked
+          ? 'Native keyboard locked off.'
+          : 'Native keyboard allowed.';
+    });
+    unawaited(_saveNativeKeyboardLock());
+    if (locked) {
+      _composerFocusNode.unfocus();
+      FocusScope.of(context).requestFocus(_terminalFocusNode);
+      _terminalFocusNode.requestFocus();
+      unawaited(SystemChannels.textInput.invokeMethod<void>('TextInput.hide'));
+    } else {
+      _focusTerminalInput();
+    }
+  }
+
+  Future<void> _loadTerminalFontSize() async {
+    final prefs = await SharedPreferences.getInstance();
+    final fontSize =
+        prefs.getDouble(_terminalFontSizeKey) ?? _terminalDefaultFontSize;
+    if (mounted) {
+      setState(() => _terminalFontSize = _boundedTerminalFontSize(fontSize));
+    }
+  }
+
+  double _boundedTerminalFontSize(double fontSize) {
+    return fontSize
+        .clamp(_terminalMinFontSize, _terminalMaxFontSize)
+        .toDouble();
+  }
+
+  Future<void> _saveTerminalFontSize() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_terminalFontSizeKey, _terminalFontSize);
+    _scheduleServerBackup();
+  }
+
+  Future<void> _loadTerminalPadConfig() async {
+    final prefs = await SharedPreferences.getInstance();
+    final source = prefs.getString(_terminalPadConfigKey);
+    if (source == null || source.isEmpty) return;
+    final config = TerminalPadConfig.decode(source);
+    if (mounted) setState(() => _padConfig = config);
+  }
+
+  Future<void> _saveTerminalPadConfig() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_terminalPadConfigKey, _padConfig.encode());
+    _scheduleServerBackup();
+  }
+
+  void _adjustTerminalFontSize(double factor) {
+    final next = _boundedTerminalFontSize(_terminalFontSize * factor);
+    if (next == _terminalFontSize) return;
+    setState(() {
+      _terminalFontSize = next;
+      _status = 'Terminal font ${next.toStringAsFixed(1)}px';
+    });
+    unawaited(_saveTerminalFontSize());
+  }
+
+  void _resetTerminalFontSize() {
+    setState(() {
+      _terminalFontSize = _terminalDefaultFontSize;
+      _status = 'Terminal font reset.';
+    });
+    unawaited(_saveTerminalFontSize());
+  }
+
+  void _collapseTerminalToolsForScroll() {
+    if (!mounted) return;
+    if (!_terminalToolsVisible &&
+        !_terminalFocusNode.hasFocus &&
+        !_composerFocusNode.hasFocus) {
+      return;
+    }
+    if (_terminalToolsVisible) {
+      setState(() => _terminalToolsVisible = false);
+      unawaited(_saveTerminalToolVisibility());
+    }
+    _hideTerminalKeyboard();
+  }
+
+  void _handleTerminalPointerDown(PointerDownEvent event) {
+    _terminalPressDownPosition = event.position;
+    _terminalPressMoved = false;
+  }
+
+  void _handleTerminalPointerMove(PointerMoveEvent event) {
+    final down = _terminalPressDownPosition;
+    if (down != null && (event.position - down).distance > 12) {
+      _terminalPressMoved = true;
+    }
+    _collapseTerminalToolsForScroll();
+    _handleTerminalScrollDelta(-event.delta.dy);
+  }
+
+  void _handleTerminalPointerUp(PointerUpEvent event) {
+    final wasTap = !_terminalPressMoved;
+    _terminalPressDownPosition = null;
+    if (!wasTap || !_connected || _tmuxScrollMode) return;
+    if (_terminalFocusNode.hasFocus) return;
+    // A tap on the terminal while the composer holds focus: dismiss the
+    // composer's keyboard, then hand focus to the terminal so it takes over on
+    // a single tap (instead of the manual close-keyboard-then-tap dance).
+    _focusTerminalInput(dismissKeyboardFirst: true);
+  }
+
+  void _handleTerminalPointerSignal(PointerSignalEvent event) {
+    _collapseTerminalToolsForScroll();
+    if (_tmuxScrollMode && event is PointerScrollEvent) {
+      _handleTerminalScrollDelta(event.scrollDelta.dy);
+    }
+    if (!_tmuxScrollMode && event is PointerScrollEvent) {
+      _handleTerminalScrollDelta(event.scrollDelta.dy);
+    }
+  }
+
+  void _handleTerminalScrollDelta(double scrollDeltaY) {
+    if (_tmuxScrollMode) {
+      _scrollTmuxCopyMode(scrollDeltaY);
+      return;
+    }
+    if (_terminal.mouseMode.reportScroll) {
+      _scrollTerminalMouseMode(scrollDeltaY);
+    }
+  }
+
+  void _scrollTmuxCopyMode(double scrollDeltaY) {
+    if (!_connected || scrollDeltaY == 0) return;
+    _tmuxScrollRemainder += scrollDeltaY;
+    var lines = (_tmuxScrollRemainder.abs() / _tmuxScrollPixelsPerLine).floor();
+    if (lines == 0) return;
+    if (lines > _tmuxScrollMaxLinesPerGesture) {
+      lines = _tmuxScrollMaxLinesPerGesture;
+    }
+    final direction = _tmuxScrollRemainder.isNegative ? -1 : 1;
+    _tmuxScrollRemainder -= direction * lines * _tmuxScrollPixelsPerLine;
+    final sequence = direction < 0 ? '\x1B[A' : '\x1B[B';
+    _writeToSession(List.filled(lines, sequence).join());
+  }
+
+  void _scrollTerminalMouseMode(double scrollDeltaY) {
+    if (!_connected || scrollDeltaY == 0) return;
+    _terminalMouseScrollRemainder += scrollDeltaY;
+    var lines = (_terminalMouseScrollRemainder.abs() / _tmuxScrollPixelsPerLine)
+        .floor();
+    if (lines == 0) return;
+    if (lines > _tmuxScrollMaxLinesPerGesture) {
+      lines = _tmuxScrollMaxLinesPerGesture;
+    }
+    final direction = _terminalMouseScrollRemainder.isNegative ? -1 : 1;
+    _terminalMouseScrollRemainder -=
+        direction * lines * _tmuxScrollPixelsPerLine;
+    final button = direction < 0
+        ? TerminalMouseButton.wheelUp
+        : TerminalMouseButton.wheelDown;
+    final position = CellOffset(
+      (_terminal.viewWidth / 2).floor(),
+      (_terminal.viewHeight / 2).floor(),
+    );
+    for (var i = 0; i < lines; i++) {
+      _terminal.mouseInput(button, TerminalMouseButtonState.down, position);
+    }
+  }
+
+  void _resetTerminalScrollGestures() {
+    _tmuxScrollRemainder = 0;
+    _terminalMouseScrollRemainder = 0;
+  }
+
+  Future<void> _loadTerminalKeyUsage() async {
+    final prefs = await SharedPreferences.getInstance();
+    final countsJson = prefs.getString(_terminalKeyUsageCountsKey);
+    if (countsJson == null || countsJson.isEmpty) return;
+    try {
+      final decoded = jsonDecode(countsJson);
+      if (decoded is! Map) return;
+      final counts = decoded.map(
+        (key, value) => MapEntry(
+          key.toString(),
+          value is int ? value : int.tryParse(value.toString()) ?? 0,
+        ),
+      );
+      if (mounted) setState(() => _terminalKeyUseCounts = counts);
+    } catch (_) {
+      if (mounted) setState(() => _terminalKeyUseCounts = {});
+    }
+  }
+
+  Future<void> _loadTmuxOrder() async {
+    final prefs = await SharedPreferences.getInstance();
+    List<String> order = const [];
+    try {
+      final decoded = jsonDecode(prefs.getString(_tmuxOrderKey) ?? '[]');
+      if (decoded is List) order = decoded.whereType<String>().toList();
+    } catch (_) {
+      order = const [];
+    }
+    if (mounted) setState(() => _tmuxOrder = order);
+  }
+
+  /// Moves the tmux button shown at [from] to [to] and keeps that arrangement.
+  void _repositionTmuxButton(List<String> shown, int from, int to) {
+    if (from < 0 || from >= shown.length) return;
+    final order = List.of(shown);
+    final moved = order.removeAt(from);
+    order.insert(to.clamp(0, order.length), moved);
+    setState(() => _tmuxOrder = order);
+    unawaited(() async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_tmuxOrderKey, jsonEncode(order));
+      _scheduleServerBackup();
+    }());
+  }
+
+  void _recordTerminalKeyUse(String id) {
+    setState(() {
+      _terminalKeyUseCounts = {
+        ..._terminalKeyUseCounts,
+        id: (_terminalKeyUseCounts[id] ?? 0) + 1,
+      };
+    });
+    unawaited(_saveTerminalKeyUsage());
+  }
+
+  Future<void> _saveTerminalKeyUsage() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _terminalKeyUsageCountsKey,
+      jsonEncode(_terminalKeyUseCounts),
+    );
+    _scheduleServerBackup();
+  }
+
+  void _activateTerminalKeyButton(String id, VoidCallback action) {
+    _recordTerminalKeyUse(id);
+    action();
+  }
+
+  Future<void> _loadProfile() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final profiles =
+          widget.profiles ?? await TerminalProfiles.load(prefs, _storage);
+      if (!mounted) return;
+      _profiles = profiles;
+      await _applyTerminalProfile();
+      if (mounted) {
+        setState(() {});
+        unawaited(_syncBackgroundSession());
+      }
+    } catch (error) {
+      _profiles = null;
+      _profileLoad = null;
+      if (mounted) {
+        setState(() => _status = 'Could not load terminal profiles: $error');
+      }
+    }
+  }
+
+  Future<void> _applyTerminalProfile([TerminalProfile? target]) async {
+    final profile = target ?? _currentProfile;
+    final password =
+        await _storage.read(key: profile.secretKey('password')) ?? '';
+    final passphrase =
+        await _storage.read(key: profile.secretKey('passphrase')) ?? '';
+    final privateKey = await _storage.read(
+      key: profile.secretKey('private_key'),
+    );
+    var publicKey = await _storage.read(key: profile.secretKey('public_key'));
+    if (privateKey != null && publicKey == null) {
+      try {
+        final keys = SSHKeyPair.fromPem(
+          privateKey,
+          passphrase.isEmpty ? null : passphrase,
+        );
+        if (keys.isNotEmpty) publicKey = _publicKeyLine(keys.first);
+      } catch (_) {
+        // An encrypted imported key may need its passphrase entered first.
+      }
+    } else if (privateKey == null) {
+      publicKey ??= await _storage.read(key: _generatedPublicKeyStorageKey);
+    }
+    if (!mounted) return;
+    _hostController.text = profile.host;
+    _portController.text = profile.port;
+    _usernameController.text = profile.username;
+    _usePrivateKey = profile.usePrivateKey;
+    _privateKeyName = profile.privateKeyName;
+    _passwordController.text = password;
+    _passphraseController.text = passphrase;
+    _generatedPublicKey = publicKey;
+  }
+
+  Future<void> _saveProfile() async {
+    final profiles = _profiles;
+    if (profiles == null) return;
+    profiles.updateProfile(
+      _currentProfile.copyWith(
+        host: _host,
+        port: _port.toString(),
+        username: _username,
+        usePrivateKey: _usePrivateKey,
+        privateKeyName: _privateKeyName,
+      ),
+    );
+    final password = _passwordController.text;
+    final passphrase = _passphraseController.text;
+    final prefs = await SharedPreferences.getInstance();
+    await profiles.save(
+      prefs,
+      _storage,
+      password: password,
+      passphrase: passphrase,
+      credentialProfileId: _currentProfile.id,
+    );
+    _scheduleServerBackup();
+  }
+
+  Future<void> _selectTerminalProfile(
+    String id, {
+    TerminalProfile? create,
+  }) async {
+    if (_profileBusy || _busy || _inputLocked) return;
+    if (create == null && id == _currentProfile.id) return;
+    if (widget.onSelectProfile != null) {
+      await _saveProfile();
+      await widget.onSelectProfile!(id, create);
+      if (mounted) Navigator.of(context).pop();
+      return;
+    }
+    setState(() => _profileBusy = true);
+    try {
+      await _saveProfile();
+      await _disconnect();
+      if (!mounted) return;
+      final target =
+          create ??
+          _profiles!.profiles.firstWhere((profile) => profile.id == id);
+      await _applyTerminalProfile(target);
+      if (!mounted) return;
+      if (create != null) _profiles!.profiles.add(create);
+      _profiles!.selectedId = id;
+      await _saveProfile();
+      if (mounted) {
+        setState(
+          () => _status = 'Selected ${_profiles!.selected.name}. Tap Connect.',
+        );
+      }
+    } catch (error) {
+      if (mounted) setState(() => _status = 'Profile switch failed: $error');
+    } finally {
+      if (mounted) setState(() => _profileBusy = false);
+    }
+  }
+
+  Future<void> _nameTerminalProfile({bool create = false}) async {
+    if (_profiles == null || _busy || _profileBusy || _inputLocked) return;
+    final controller = TextEditingController(
+      text: create ? '' : _currentProfile.name,
+    );
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(
+          create ? 'New terminal profile' : 'Rename terminal profile',
+        ),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Profile name'),
+          onSubmitted: (value) {
+            if (value.trim().isNotEmpty) Navigator.pop(ctx, value.trim());
+          },
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (controller.text.trim().isNotEmpty) {
+                Navigator.pop(ctx, controller.text.trim());
+              }
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    controller.dispose();
+    if (name == null || !mounted) return;
+    if (create) {
+      final profile = TerminalProfile(
+        id: DateTime.now().microsecondsSinceEpoch.toString(),
+        name: name,
+      );
+      await _selectTerminalProfile(profile.id, create: profile);
+    } else {
+      final profile = _currentProfile;
+      _profiles!.updateProfile(profile.copyWith(name: name));
+      await _saveProfile();
+      if (mounted) {
+        setState(() {});
+        widget.onProfilesChanged?.call();
+      }
+    }
+  }
+
+  Future<void> _loadBackgroundKeepAlive() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool(_backgroundKeepAliveKey) ?? true;
+    final exempt = Platform.isAndroid
+        ? await BackgroundSessionService.isBatteryOptimizationExempt()
+        : true;
+    if (!mounted) return;
+    setState(() {
+      _keepAliveInBackground = enabled;
+      _batteryOptimizationExempt = exempt;
+    });
+  }
+
+  Future<void> _setKeepAliveInBackground(bool enabled) async {
+    setState(() => _keepAliveInBackground = enabled);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_backgroundKeepAliveKey, enabled);
+    await _syncBackgroundSession();
+    _scheduleServerBackup();
+  }
+
+  /// Mirrors the foreground service to the session state: running whenever a
+  /// session is up or being recovered, gone the moment the user disconnects.
+  Future<void> _syncBackgroundSession() async {
+    _notificationBridge.enabled =
+        _keepAliveInBackground && (_connected || _wantConnected);
+    _notificationBridge.publish();
+    if (mounted) widget.onConnectionChanged?.call(_connected);
+    if (!Platform.isAndroid) return;
+    final target = '$_username@$_host';
+    final disconnected = !_connected && !_repairingNetwork;
+    await BackgroundSessionService.updateSession(
+      this,
+      keepAlive:
+          _keepAliveInBackground &&
+          _sessionNotificationStarted &&
+          (_connected || _wantConnected),
+      active: mounted && widget.active,
+      label: _connected
+          ? 'Connected to $target'
+          : _repairingNetwork
+          ? 'Restarting ZeroTier before reconnecting to $target'
+          : _wantConnected
+          ? 'Reconnecting to $target'
+          : 'Disconnected from $target',
+      action: _connected || _busy ? 'disconnect' : 'connect',
+      actionLabel: _connected
+          ? 'Disconnect'
+          : _busy
+          ? 'Stop'
+          : _wantConnected
+          ? 'Reconnect now'
+          : 'Reconnect',
+      zeroTierRecovery: disconnected && widget.onZeroTierRecovery != null,
+    );
+  }
+
+  Future<void> _onNotificationSessionAction(String action) async {
+    if (_repairingNetwork) return;
+    if (action == 'disconnect') {
+      await _disconnect();
+    } else if (action == 'connect') {
+      if (!_connected && !_busy) await _connect();
+    } else if (action == 'restartZeroTier') {
+      await _restartZeroTierAndReconnect();
+    }
+  }
+
+  Future<void> _restartZeroTierAndReconnect() async {
+    final recover = widget.onZeroTierRecovery;
+    if (recover == null || _repairingNetwork) return;
+    _repairingNetwork = true;
+    if (mounted) setState(() => _status = 'Checking ZeroTier recovery...');
+    await _syncBackgroundSession();
+    var repaired = false;
+    try {
+      repaired = await recover();
+    } catch (error) {
+      if (mounted) setState(() => _status = 'ZeroTier restart failed: $error');
+    } finally {
+      _repairingNetwork = false;
+    }
+    if (!mounted) return;
+    if (repaired) {
+      await _disconnect();
+      await _connect();
+    } else {
+      setState(() {
+        if (_status == 'Checking ZeroTier recovery...') {
+          _status = 'ZeroTier recovery stopped. See the macro failure details.';
+        }
+      });
+      await _syncBackgroundSession();
+    }
+  }
+
+  /// A foreground service keeps the process off the freezer, but Doze can still
+  /// stall an idle screen-off session. Ask once, the first time it matters.
+  Future<void> _maybePromptBatteryExemption() async {
+    if (!Platform.isAndroid || !_keepAliveInBackground) return;
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool(_backgroundBatteryPromptKey) ?? false) return;
+    if (await BackgroundSessionService.isBatteryOptimizationExempt()) {
+      if (mounted) setState(() => _batteryOptimizationExempt = true);
+      return;
+    }
+    await prefs.setBool(_backgroundBatteryPromptKey, true);
+    if (!mounted) return;
+    final allow = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Keep the session alive?'),
+        content: const Text(
+          'Android can still suspend DevOTA while the screen is off, which '
+          'drops the SSH session. Marking DevOTA as unrestricted in battery '
+          'settings keeps long builds and agent runs connected.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Not now'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Allow'),
+          ),
+        ],
+      ),
+    );
+    if (allow != true) return;
+    await BackgroundSessionService.requestBatteryOptimizationExemption();
+    final exempt = await BackgroundSessionService.isBatteryOptimizationExempt();
+    if (mounted) setState(() => _batteryOptimizationExempt = exempt);
+  }
+
+  void _scheduleServerBackup() {
+    _backupDebounce?.cancel();
+    _backupDebounce = Timer(const Duration(seconds: 2), () {
+      _saveBackupToServerSilently();
+    });
+  }
+
+  Future<void> _saveBackupToServerSilently() async {
+    try {
+      if (!await BackupService.hasLocalRestorableData()) return;
+      await BackupService.saveToServer(widget.dio, widget.serverUrl);
+    } catch (_) {
+      // Keep terminal edits local even when the server is unavailable.
+    }
+  }
+
+  Future<void> _pickPrivateKey() async {
+    final picked = await FilePicker.pickFiles(withData: true);
+    if (!mounted) return;
+    final file = picked?.files.isNotEmpty == true ? picked!.files.first : null;
+    final bytes = file?.bytes;
+    if (file == null || bytes == null) return;
+    final pem = utf8.decode(bytes);
+    await _storage.write(key: _privateKeyStorageKey, value: pem);
+    await _storage.delete(key: _currentProfile.secretKey('public_key'));
+    await _applyTerminalProfile();
+    if (!mounted) return;
+    setState(() => _privateKeyName = file.name);
+    await _saveProfile();
+  }
+
+  String _publicKeyLine(SSHKeyPair keyPair) {
+    final comment = keyPair is OpenSSHEd25519KeyPair
+        ? keyPair.comment
+        : 'devota-phone';
+    return '${keyPair.name} ${base64.encode(keyPair.toPublicKey().encode())} $comment';
+  }
+
+  Future<void> _generateTerminalKey() async {
+    setState(() {
+      _busy = true;
+      _status = 'Generating Ed25519 key...';
+    });
+    try {
+      final signingKey = ed25519.SigningKey.generate();
+      final comment =
+          'devota-phone-${DateTime.now().toUtc().toIso8601String()}';
+      final keyPair = OpenSSHEd25519KeyPair(
+        Uint8List.fromList(signingKey.verifyKey.asTypedList),
+        Uint8List.fromList(signingKey.asTypedList),
+        comment,
+      );
+      final pem = keyPair.toPem();
+      final publicKey = _publicKeyLine(keyPair);
+      await _storage.write(key: _generatedPrivateKeyStorageKey, value: pem);
+      await _storage.write(
+        key: _generatedPublicKeyStorageKey,
+        value: publicKey,
+      );
+      await _storage.write(key: _privateKeyStorageKey, value: pem);
+      await _storage.write(
+        key: _currentProfile.secretKey('public_key'),
+        value: publicKey,
+      );
+      setState(() {
+        _usePrivateKey = true;
+        _privateKeyName = 'DevOTA phone key';
+        _generatedPublicKey = publicKey;
+        _status = 'Generated DevOTA phone key.';
+      });
+      await _saveProfile();
+    } catch (e) {
+      setState(() => _status = 'Key generation failed: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<String?> _currentPrivateKeyPem() async {
+    final profilePem = await _storage.read(key: _privateKeyStorageKey);
+    if (profilePem != null && profilePem.trim().isNotEmpty) return profilePem;
+    return _storage.read(key: _generatedPrivateKeyStorageKey);
+  }
+
+  Future<void> _copyPublicKey() async {
+    final publicKey = _generatedPublicKey;
+    if (publicKey == null || publicKey.trim().isEmpty) {
+      setState(() => _status = 'Generate a key first.');
+      return;
+    }
+    await Clipboard.setData(ClipboardData(text: publicKey));
+    setState(() => _status = 'Public key copied.');
+  }
+
+  Future<void> _sendPublicKeyToServer() async {
+    final publicKey = _generatedPublicKey;
+    if (publicKey == null || publicKey.trim().isEmpty) {
+      setState(() => _status = 'Generate a key first.');
+      return;
+    }
+    final baseUrl = widget.serverUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    if (baseUrl.isEmpty) {
+      setState(() => _status = 'Select a build server first.');
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _status = 'Sending public key to build server...';
+    });
+    try {
+      final resp = await widget.dio.post(
+        '$baseUrl/ssh/authorized-key',
+        data: {'publicKey': publicKey, 'target': 'auto'},
+        options: Options(
+          headers: {'Content-Type': 'application/json'},
+          sendTimeout: const Duration(seconds: 8),
+          receiveTimeout: const Duration(seconds: 12),
+        ),
+      );
+      final data = resp.data is Map
+          ? Map<String, dynamic>.from(resp.data as Map)
+          : const <String, dynamic>{};
+      final target = data['target']?.toString() ?? 'server';
+      final path = data['path']?.toString();
+      final already = data['alreadyPresent'] == true;
+      final approvalRequired = data['approvalRequired'] == true;
+      final warnings = data['warnings'] is List
+          ? (data['warnings'] as List).map((item) => item.toString()).toList()
+          : const <String>[];
+      final warningText = warnings.isEmpty ? '' : ' Warning: ${warnings.first}';
+      setState(() {
+        if (approvalRequired) {
+          _status =
+              'Windows administrator approval requested. Accept the Windows prompt, return here, then tap Connect.';
+        } else {
+          _status = already
+              ? 'Public key was already installed on $target.$warningText'
+              : 'Public key installed on $target${path == null ? '' : ' at $path'}.$warningText';
+        }
+      });
+    } on DioException catch (e) {
+      if (e.response?.statusCode == 404) {
+        await _sendPublicKeyToServerClipboard(baseUrl, publicKey);
+      } else {
+        setState(() => _status = 'Public key push failed: ${_dioError(e)}');
+      }
+    } catch (e) {
+      setState(() => _status = 'Public key push failed: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  String _dioError(DioException e) {
+    final code = e.response?.statusCode;
+    final reason = e.response?.statusMessage;
+    if (code != null && reason != null && reason.trim().isNotEmpty) {
+      return 'HTTP $code: $reason';
+    }
+    final data = e.response?.data;
+    if (code != null && data != null) {
+      final text = data
+          .toString()
+          .replaceAll(RegExp(r'<[^>]+>'), ' ')
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
+      if (text.isNotEmpty) {
+        return 'HTTP $code: ${text.length > 180 ? '${text.substring(0, 180)}...' : text}';
+      }
+      return 'HTTP $code';
+    }
+    final message = e.message;
+    if (message != null && message.trim().isNotEmpty) return message;
+    return e.type.name;
+  }
+
+  Future<void> _sendPublicKeyToServerClipboard(
+    String baseUrl,
+    String publicKey,
+  ) async {
+    final resp = await widget.dio.post(
+      '$baseUrl/clipboard',
+      data: publicKey,
+      options: Options(
+        headers: {'Content-Type': 'text/plain; charset=utf-8'},
+        sendTimeout: const Duration(seconds: 8),
+        receiveTimeout: const Duration(seconds: 8),
+      ),
+    );
+    setState(() {
+      _status = resp.statusCode == 200
+          ? 'Public key sent to PC clipboard.'
+          : 'Clipboard push returned HTTP ${resp.statusCode}.';
+    });
+  }
+
+  Future<void> _ping() async {
+    if (_host.isEmpty) return;
+    setState(() {
+      _busy = true;
+      _status = 'Pinging $_host:$_port...';
+    });
+    final started = DateTime.now();
+    try {
+      final addresses = await InternetAddress.lookup(
+        _host,
+      ).timeout(const Duration(seconds: 8));
+      final address = addresses.first.address;
+      final socket = await Socket.connect(
+        address,
+        _port,
+        timeout: const Duration(seconds: 6),
+      );
+      socket.destroy();
+      final ms = DateTime.now().difference(started).inMilliseconds;
+      setState(() => _status = 'Reachable at $address:$_port in ${ms}ms');
+    } catch (e) {
+      setState(() => _status = 'Ping failed: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<bool> _verifyHostKey(String type, Uint8List fingerprintBytes) async {
+    final fingerprint = utf8.decode(fingerprintBytes);
+    final saved = await _storage.read(key: _hostKeyStorageKey);
+    if (saved == fingerprint) return true;
+    if (saved != null && saved != fingerprint) {
+      if (mounted) {
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Host key changed'),
+            content: SelectableText('Saved: $saved\nNew: $fingerprint'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+        );
+      }
+      return false;
+    }
+    if (!mounted) return false;
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Trust SSH host?'),
+        content: SelectableText('$type\n$fingerprint'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Trust'),
+          ),
+        ],
+      ),
+    );
+    if (accepted == true) {
+      await _storage.write(key: _hostKeyStorageKey, value: fingerprint);
+      return true;
+    }
+    return false;
+  }
+
+  Future<void> _connect({bool auto = false}) async {
+    if (_host.isEmpty || _username.isEmpty) {
+      setState(() => _status = 'Host and username are required.');
+      return;
+    }
+    if (_busy || _profileBusy || _profiles == null || _connected) return;
+    _reconnectTimer?.cancel();
+    _sessionNotificationStarted = true;
+    _wantConnected = true;
+    if (!auto) _reconnectAttempts = 0;
+    await _saveProfile();
+    if (!mounted) return;
+    setState(() {
+      _busy = true;
+      _status = auto ? 'Reconnecting...' : 'Connecting...';
+    });
+    unawaited(_syncBackgroundSession());
+    _terminal.write(
+      '\r\n${auto ? 'Reconnecting' : 'Connecting'} to $_username@$_host:$_port...\r\n',
+    );
+    try {
+      List<SSHKeyPair>? identities;
+      if (_usePrivateKey) {
+        final pem = await _currentPrivateKeyPem();
+        if (pem == null || pem.trim().isEmpty) {
+          throw StateError('Import or generate a private key first.');
+        }
+        identities = SSHKeyPair.fromPem(
+          pem,
+          _passphraseController.text.isEmpty
+              ? null
+              : _passphraseController.text,
+        );
+      }
+      final socket = await SSHSocket.connect(
+        _host,
+        _port,
+        timeout: const Duration(seconds: 12),
+      );
+      final client = SSHClient(
+        socket,
+        username: _username,
+        identities: identities,
+        onPasswordRequest: _usePrivateKey
+            ? null
+            : () => _passwordController.text,
+        onVerifyHostKey: _verifyHostKey,
+        // Keep the socket warm through phone NATs and idle-timeout sshd
+        // configs. This only helps while the process is actually running,
+        // which is what the foreground service below guarantees.
+        keepAliveInterval: const Duration(seconds: 15),
+      );
+      await client.authenticated;
+      final session = await client.shell(
+        pty: SSHPtyConfig(
+          width: _terminal.viewWidth,
+          height: _terminal.viewHeight,
+        ),
+      );
+      if (!_wantConnected) {
+        session.close();
+        client.close();
+        return;
+      }
+      _client = client;
+      _session = session;
+      _terminal.buffer.clear();
+      _terminal.buffer.setCursor(0, 0);
+      _stdoutSub = session.stdout
+          .cast<List<int>>()
+          .transform(const Utf8Decoder())
+          .listen(_terminal.write);
+      _stderrSub = session.stderr
+          .cast<List<int>>()
+          .transform(const Utf8Decoder())
+          .listen(_terminal.write);
+      // Either end of the connection dying should look the same to the user:
+      // the shell going away, or the transport dropping under it.
+      session.done.whenComplete(() => _handleSessionClosed(client));
+      client.done.whenComplete(() => _handleSessionClosed(client));
+      _reconnectAttempts = 0;
+      if (mounted) {
+        setState(() {
+          _connected = true;
+          _status = 'Connected to $_host:$_port';
+        });
+      }
+      unawaited(_syncBackgroundSession());
+      await _connectWatch(client);
+      if (!auto) unawaited(_maybePromptBatteryExemption());
+      _notifyMacroController();
+    } catch (e) {
+      _terminal.write('Connection failed: $e\r\n');
+      if (mounted) setState(() => _status = 'Connection failed: $e');
+      await _disconnect(userInitiated: false);
+      _scheduleReconnect('Connection failed');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+      unawaited(_syncBackgroundSession());
+      _notifyMacroController();
+    }
+  }
+
+  /// Called when the shell or the transport goes away on its own — an idle
+  /// timeout, a network change, or the OS having frozen us for long enough that
+  /// the peer gave up.
+  void _handleSessionClosed(SSHClient client) {
+    if (!identical(_client, client)) return; // A stale connection winding down.
+    _watch.connect(null);
+    _client = null;
+    _session = null;
+    unawaited(_stdoutSub?.cancel());
+    unawaited(_stderrSub?.cancel());
+    _stdoutSub = null;
+    _stderrSub = null;
+    if (mounted) {
+      setState(() {
+        _connected = false;
+        _status = _wantConnected
+            ? 'SSH session dropped.'
+            : 'SSH session closed.';
+      });
+    } else {
+      _connected = false;
+    }
+    _notifyMacroController();
+    if (_wantConnected) {
+      _scheduleReconnect('SSH session dropped');
+    } else {
+      unawaited(_syncBackgroundSession());
+    }
+  }
+
+  /// Retries with a widening backoff. The foreground service is what makes this
+  /// worth doing while backgrounded — without it the retry timer would be
+  /// frozen alongside everything else.
+  void _scheduleReconnect(String reason) {
+    if (!_wantConnected) return;
+    _reconnectTimer?.cancel();
+    const backoff = [2, 5, 10, 20, 30, 60];
+    if (_reconnectAttempts >= 8) {
+      _wantConnected = false;
+      if (mounted) {
+        setState(
+          () => _status = '$reason. Auto-reconnect gave up; tap Connect.',
+        );
+      }
+      unawaited(_syncBackgroundSession());
+      return;
+    }
+    final delay = backoff[_reconnectAttempts.clamp(0, backoff.length - 1)];
+    _reconnectAttempts++;
+    if (mounted) {
+      setState(() => _status = '$reason. Reconnecting in ${delay}s...');
+    }
+    unawaited(_syncBackgroundSession());
+    _reconnectTimer = Timer(Duration(seconds: delay), () {
+      if (!_wantConnected || _connected || _busy) return;
+      unawaited(_connect(auto: true));
+    });
+  }
+
+  Future<void> _disconnect({bool userInitiated = true}) async {
+    if (mounted && !_disposing) _watch.connect(null);
+    if (userInitiated) {
+      _wantConnected = false;
+      _reconnectAttempts = 0;
+      _reconnectTimer?.cancel();
+    }
+    await _stdoutSub?.cancel();
+    await _stderrSub?.cancel();
+    _stdoutSub = null;
+    _stderrSub = null;
+    _session?.close();
+    _client?.close();
+    _session = null;
+    _client = null;
+    if (mounted) {
+      setState(() {
+        _connected = false;
+        _macroRunning = false;
+        _macroStopRequested = false;
+        _macroRunningName = null;
+        _macroStepIndex = 0;
+        _macroStepCount = 0;
+      });
+    } else {
+      _connected = false;
+    }
+    unawaited(_syncBackgroundSession());
+    _resetTerminalScrollGestures();
+    _notifyMacroController();
+  }
+
+  void _writeToSession(String text) {
+    if (!_connected) return;
+    _writeSessionBytes(text);
+  }
+
+  void _writeSessionBytes(String text) {
+    final sink = widget.testHooks?.sessionSink;
+    if (sink != null) {
+      sink(text);
+      return;
+    }
+    _session?.write(Uint8List.fromList(utf8.encode(text)));
+  }
+
+  void _focusTerminalInput({bool dismissKeyboardFirst = false}) {
+    _composerFocusNode.unfocus();
+    if (dismissKeyboardFirst) {
+      // Fully close the composer's keyboard connection before re-acquiring it
+      // for the terminal; without this reset the focus change can stick on the
+      // composer (the bug this fixes). The terminal re-opens it on the frames
+      // below.
+      unawaited(SystemChannels.textInput.invokeMethod<void>('TextInput.hide'));
+    }
+    void requestTerminalFocus() {
+      if (!mounted || !_connected || _tmuxScrollMode) return;
+      FocusScope.of(context).requestFocus(_terminalFocusNode);
+      _terminalFocusNode.requestFocus();
+      unawaited(
+        SystemChannels.textInput.invokeMethod<void>(
+          _nativeKeyboardLocked ? 'TextInput.hide' : 'TextInput.show',
+        ),
+      );
+    }
+
+    // When dismissing first, let the IME settle for a frame before re-focusing
+    // so the hide isn't cancelled by an immediate show.
+    if (!dismissKeyboardFirst) requestTerminalFocus();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      requestTerminalFocus();
+    });
+    unawaited(
+      Future<void>.delayed(const Duration(milliseconds: 90), () {
+        requestTerminalFocus();
+      }),
+    );
+    unawaited(
+      Future<void>.delayed(const Duration(milliseconds: 220), () {
+        requestTerminalFocus();
+      }),
+    );
+  }
+
+  void _hideTerminalKeyboard() {
+    _terminalFocusNode.unfocus();
+    _composerFocusNode.unfocus();
+    unawaited(SystemChannels.textInput.invokeMethod<void>('TextInput.hide'));
+  }
+
+  void _sendTerminalKey(String sequence, {String? fallbackText}) {
+    // Last line of defence: the macro writes through _writeToSession, so any
+    // other keystroke path stays shut until the sequence finishes.
+    if (_inputLocked) return;
+    if (_connected) {
+      _writeToSession(sequence);
+      return;
+    }
+    if (fallbackText != null) _insertComposerText(fallbackText);
+  }
+
+  void _sendTmuxCommand(String command) {
+    _sendTerminalKey('\x02$command');
+  }
+
+  void _enableTmuxMouse() {
+    _sendTerminalKey('\x02:set -g mouse on\r');
+    if (mounted) {
+      setState(() => _status = 'tmux mouse enabled for this session.');
+    }
+  }
+
+  void _enterTmuxScrollMode() {
+    _sendTmuxCommand('[');
+    _hideTerminalKeyboard();
+    _resetTerminalScrollGestures();
+    if (mounted) {
+      setState(() {
+        _tmuxScrollMode = true;
+        _status = 'tmux scroll mode: tap Exit scroll or Esc to type again.';
+      });
+    }
+  }
+
+  void _exitTmuxScrollMode() {
+    _sendTerminalKey('q');
+    _resetTerminalScrollGestures();
+    if (mounted) {
+      setState(() {
+        _tmuxScrollMode = false;
+        _status = 'Exited tmux scroll mode.';
+      });
+    }
+    _focusTerminalInput();
+  }
+
+  void _exitTmuxScrollModeWithEsc() {
+    _sendTerminalKey('\x1B');
+    _resetTerminalScrollGestures();
+    if (mounted) {
+      setState(() {
+        _tmuxScrollMode = false;
+        _status = 'Exited tmux scroll mode.';
+      });
+    }
+    _focusTerminalInput();
+  }
+
+  void _insertComposerText(String text) {
+    final selection = _composerController.selection;
+    final value = _composerController.text;
+    final start = selection.isValid ? selection.start : value.length;
+    final end = selection.isValid ? selection.end : value.length;
+    final next = value.replaceRange(start, end, text);
+    _composerController.value = TextEditingValue(
+      text: next,
+      selection: TextSelection.collapsed(offset: start + text.length),
+    );
+  }
+
+  void _submitComposer() {
+    final text = _composerController.text.trim();
+    if (text.isEmpty || !_connected) return;
+    _submitTextToTerminal(text);
+  }
+
+  void _appendComposerText(String text) {
+    if (text.trim().isEmpty) return;
+    final existing = _composerController.text;
+    _composerController.text = existing.isEmpty ? text : '$existing $text';
+    _composerController.selection = TextSelection.fromPosition(
+      TextPosition(offset: _composerController.text.length),
+    );
+  }
+
+  void _prefixComposerText(String text) {
+    final prefix = text.trim();
+    if (prefix.isEmpty) return;
+    final existing = _composerController.text.trimLeft();
+    _composerController.text = existing.isEmpty ? prefix : '$prefix $existing';
+    _composerController.selection = TextSelection.fromPosition(
+      TextPosition(offset: _composerController.text.length),
+    );
+  }
+
+  void _submitTextToTerminal(String text) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty || !_connected || _inputLocked) return;
+    _writeToSession('$trimmed\n');
+    _composerController.clear();
+    _focusTerminalInput();
+  }
+
+  void _runSavedCommand(String command) {
+    final trimmed = command.trim();
+    if (trimmed.isEmpty || _inputLocked) return;
+    widget.onCommandUsed?.call(trimmed);
+    if (_composerController.text.trim().isNotEmpty) {
+      _prefixComposerText(trimmed);
+      setState(() => _status = 'Command prefix inserted.');
+      _focusTerminalInput();
+      return;
+    }
+    if (_connected) {
+      _submitTextToTerminal(trimmed);
+    } else {
+      _appendComposerText(trimmed);
+      setState(() => _status = 'Command inserted. Connect before submitting.');
+    }
+  }
+
+  String? _macroTerminalKeySequence(String value) {
+    return switch (value) {
+      'enter' => '\r',
+      'backspace' => '\x7F',
+      'ctrl_b' => '\x02',
+      'ctrl_c' => '\x03',
+      'tab' => '\t',
+      'esc' => '\x1B',
+      'slash' => '/',
+      '0' => '0',
+      '1' => '1',
+      '2' => '2',
+      '3' => '3',
+      '4' => '4',
+      '5' => '5',
+      '6' => '6',
+      '7' => '7',
+      '8' => '8',
+      '9' => '9',
+      'home' => '\x1B[H',
+      'end' => '\x1B[F',
+      'page_up' => '\x1B[5~',
+      'page_down' => '\x1B[6~',
+      'up' => '\x1B[A',
+      'down' => '\x1B[B',
+      'left' => '\x1B[D',
+      'right' => '\x1B[C',
+      _ => null,
+    };
+  }
+
+  Future<void> _runMacro(TerminalMacro macro) async {
+    if (!_connected) {
+      setState(() => _status = 'Connect SSH before running macros.');
+      throw StateError('Connect SSH before running macros.');
+    }
+    if (_inputLocked) {
+      throw StateError('A macro is already running.');
+    }
+    widget.onMacroUsed?.call(macro);
+    setState(() {
+      _macroRunning = true;
+      _macroStopRequested = false;
+      _macroRunningName = macro.name;
+      _macroStepIndex = 0;
+      _macroStepCount = macro.steps.length;
+      _status = 'Running macro: ${macro.name}';
+    });
+    _notifyMacroController();
+    _focusTerminalInput();
+    try {
+      macro = await MacroSyncService.resolveForRun(
+        widget.dio,
+        widget.serverUrl,
+        macro,
+      );
+      if (_macroStopRequested) return;
+      if (!_connected) throw StateError('SSH disconnected.');
+      for (var i = 0; i < macro.steps.length; i++) {
+        if (_macroStopRequested) break;
+        if (!_connected) throw StateError('SSH disconnected.');
+        final step = macro.steps[i];
+        if (mounted) setState(() => _macroStepIndex = i + 1);
+        _notifyMacroController();
+        switch (step.type) {
+          case TerminalMacroStepType.shell:
+            final command = step.value;
+            if (command.trim().isNotEmpty) {
+              _terminal.paste(command);
+              if (!await _macroDelay(
+                terminalPasteSettleTime.inMilliseconds / 1000,
+              )) {
+                break;
+              }
+              if (commandNeedsEnter(macro.steps, i)) _writeToSession('\r');
+            }
+            break;
+          case TerminalMacroStepType.terminalKey:
+            final sequence = _macroTerminalKeySequence(step.value);
+            if (sequence == null) {
+              throw StateError('Unknown terminal key: ${step.value}');
+            }
+            _writeToSession(sequence);
+            break;
+          case TerminalMacroStepType.tmux:
+            final sequence = terminalMacroTmuxSequence(step.value);
+            if (sequence == null) {
+              throw StateError('Unknown tmux command.');
+            }
+            _writeToSession(sequence);
+            break;
+          case TerminalMacroStepType.wait:
+            break;
+          case TerminalMacroStepType.device:
+            throw StateError(
+              'Device actions run from the Macros tab, not the SSH terminal.',
+            );
+        }
+        if (step.delaySeconds > 0) {
+          if (!await _macroDelay(step.delaySeconds)) break;
+        }
+      }
+      if (mounted) {
+        setState(
+          () => _status = _macroStopRequested
+              ? 'Macro stopped at step $_macroStepIndex: ${macro.name}'
+              : 'Input sent (submission unconfirmed): ${macro.name}',
+        );
+      }
+    } catch (e) {
+      if (mounted) setState(() => _status = 'Macro stopped: $e');
+      rethrow;
+    } finally {
+      if (mounted) {
+        setState(() {
+          _macroRunning = false;
+          _macroStopRequested = false;
+          _macroRunningName = null;
+          _macroStepIndex = 0;
+          _macroStepCount = 0;
+        });
+        _notifyMacroController();
+        _focusTerminalInput();
+      }
+    }
+  }
+
+  /// Sleeps a step's delay in short slices so Stop lands mid-wait instead of
+  /// after a 30-second pause. Returns false when the run should end.
+  Future<bool> _macroDelay(double seconds) async {
+    final total = (seconds * 1000).round();
+    var elapsed = 0;
+    while (elapsed < total) {
+      if (_macroStopRequested || !mounted || !_connected) return false;
+      final remaining = total - elapsed;
+      final slice = remaining < 100 ? remaining : 100;
+      await Future<void>.delayed(Duration(milliseconds: slice));
+      elapsed += slice;
+    }
+    return !_macroStopRequested && mounted;
+  }
+
+  Future<void> _attachFileToTerminal() async {
+    if (_busy) return;
+    await _profileLoad;
+    if (!mounted || _profiles == null) return;
+    final baseUrl =
+        (widget.profiles == null ? widget.serverUrl : _currentProfile.serverUrl)
+            .trim()
+            .replaceAll(RegExp(r'/+$'), '');
+    if (baseUrl.isEmpty) {
+      setState(
+        () => _status =
+            'Set this computer’s build server in Connect before attaching files.',
+      );
+      return;
+    }
+    final picked = await FilePicker.pickFiles(withData: true);
+    if (!mounted) return;
+    final file = picked?.files.isNotEmpty == true ? picked!.files.first : null;
+    if (file == null) return;
+    if (file.bytes == null && file.path == null) {
+      setState(() => _status = 'Could not read selected file.');
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _status = 'Uploading file to build server...';
+    });
+    try {
+      final upload = file.bytes != null
+          ? MultipartFile.fromBytes(file.bytes!, filename: file.name)
+          : await MultipartFile.fromFile(file.path!, filename: file.name);
+      final resp = await widget.dio.post(
+        '$baseUrl/terminal/upload',
+        data: FormData.fromMap({'file': upload}),
+        options: Options(
+          sendTimeout: const Duration(seconds: 45),
+          receiveTimeout: const Duration(seconds: 30),
+        ),
+      );
+      final data = resp.data is Map
+          ? Map<String, dynamic>.from(resp.data as Map)
+          : const <String, dynamic>{};
+      final terminalText =
+          data['terminalText']?.toString() ?? data['path']?.toString() ?? '';
+      if (terminalText.isEmpty) {
+        throw StateError('Server did not return an uploaded path.');
+      }
+      if (_connected) {
+        _writeToSession(terminalText);
+        _focusTerminalInput();
+      } else {
+        _appendComposerText(terminalText);
+      }
+      if (mounted) {
+        setState(() => _status = 'File attached: $terminalText');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _status = 'File attach failed: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  void _showVoiceInputError(Object error) {
+    if (!mounted) return;
+    final message = voiceInputErrorMessage(error);
+    setState(() => _status = message);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 8)),
+    );
+  }
+
+  Future<void> _startVoiceRecording() async {
+    if (_transcribing || _recording) return;
+    setState(() => _transcribing = true);
+    try {
+      var key = await _voice.loadApiKey();
+      if (!mounted) return;
+      if (key == null || key.trim().isEmpty) {
+        key = await _promptApiKey();
+        if (!mounted) return;
+        if (key == null || key.trim().isEmpty) {
+          throw const VoiceInputException(missingVoiceApiKey);
+        }
+      }
+      final ok = await _voice.requestMicrophone();
+      if (!mounted) return;
+      if (!ok) {
+        throw const VoiceInputException(
+          'Microphone permission is required for voice input.',
+        );
+      }
+      await _voice.startRecording('terminal_voice.m4a');
+      if (!mounted) {
+        await VoiceInputService.deleteRecording(await _voice.stopRecording());
+        return;
+      }
+      setState(() {
+        _recording = true;
+        _status = 'Recording voice input...';
+      });
+    } catch (error) {
+      _showVoiceInputError(error);
+    } finally {
+      if (mounted) setState(() => _transcribing = false);
+    }
+  }
+
+  Future<void> _finishVoiceRecording() async {
+    if (_transcribing) return;
+    setState(() {
+      _transcribing = true;
+      _status = 'Transcribing voice input...';
+    });
+    String? path;
+    try {
+      path = await _voice.stopRecording();
+      if (!mounted) return;
+      setState(() => _recording = false);
+      final key = await _voice.loadApiKey();
+      final text = await _voice.transcribe(path, key);
+      if (!mounted) return;
+      _appendComposerText(text);
+      _composerFocusNode.requestFocus();
+      setState(() => _status = 'Transcript added.');
+    } catch (error) {
+      _showVoiceInputError(error);
+    } finally {
+      await VoiceInputService.deleteRecording(path);
+      if (mounted) setState(() => _transcribing = false);
+    }
+  }
+
+  Future<String?> _promptApiKey() async {
+    final initialValue = await _voice.loadApiKey() ?? '';
+    if (!mounted) return null;
+    final key = await OpenAiKeyDialog.show(context, initialValue: initialValue);
+    if (key != null && key.isNotEmpty) {
+      await _voice.saveApiKey(key);
+      _scheduleServerBackup();
+    }
+    return key;
+  }
+
+  // --- Voice control --------------------------------------------------------
+  //
+  // The mic toggle in the top bar. Everything it does goes through the same
+  // handlers this tab's own buttons use, on this tab's current session.
+
+  Future<void> _loadVoiceQuietBeeps() async {
+    final prefs = await SharedPreferences.getInstance();
+    _voiceSession.quietBeeps = prefs.getBool(_voiceQuietBeepsKey) ?? true;
+  }
+
+  Future<void> _setVoiceQuietBeeps(bool quiet) async {
+    setState(() => _voiceSession.quietBeeps = quiet);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_voiceQuietBeepsKey, quiet);
+  }
+
+  void _onVoiceChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _toggleVoiceControl() async {
+    await _voiceSession.setEnabled(!_voiceSession.enabled);
+  }
+
+  bool get _canSubmitComposer =>
+      _connected && !_transcribing && !_recording && !_inputLocked;
+
+  VoidCallback _padKeyTap(TerminalPadKey key) =>
+      () => _activateTerminalPadKey(key);
+
+  VoidCallback _arrowTap(_ArrowKey arrow) =>
+      () => _activateTerminalKeyButton(
+        arrow.id,
+        () => _sendTerminalKey(arrow.sequence),
+      );
+
+  VoidCallback _tmuxTap(_TmuxButton button) =>
+      () => _activateTerminalKeyButton(button.id, button.action);
+
+  VoidCallback _macroTap(TerminalMacro macro) =>
+      () => unawaited(_runMacro(macro).catchError((Object _) {}));
+
+  VoidCallback _commandTap(String command) =>
+      () => _runSavedCommand(command);
+
+  /// Ctrl-C (or a custom key that sends it) asks for "yes" first.
+  bool _padKeyNeedsConfirm(TerminalPadKey key) =>
+      key.id == 'ctrl_c' || decodeKeySequence(key.sequence) == '\x03';
+
+  @override
+  bool get voiceConnected => _connected;
+
+  @override
+  bool get voiceBusy => _inputLocked;
+
+  @override
+  List<VoiceTarget> get voiceTargets => [
+    for (final key in _allPadKeys)
+      VoiceTarget(
+        kind: VoiceTargetKind.padKey,
+        id: key.id,
+        label: key.name,
+        abbreviation: key.abbreviation,
+        enabled: (_connected || key.enabledWhenDisconnected) && !_inputLocked,
+        confirm: _padKeyNeedsConfirm(key),
+        run: _padKeyTap(key),
+      ),
+    for (final arrow in _arrowKeys)
+      VoiceTarget(
+        kind: VoiceTargetKind.arrow,
+        id: arrow.id,
+        label: arrow.tooltip,
+        run: _arrowTap(arrow),
+      ),
+    for (final button in _tmuxButtons())
+      VoiceTarget(
+        kind: VoiceTargetKind.tmux,
+        id: button.id,
+        label: button.label,
+        tooltip: button.tooltip,
+        enabled: _tmuxBarEnabled,
+        run: _tmuxTap(button),
+      ),
+    for (final macro in widget.quickMacros)
+      VoiceTarget(
+        kind: VoiceTargetKind.macro,
+        id: macro.id,
+        label: macro.name,
+        enabled: _macroBarEnabled,
+        confirm: isExitLabel(macro.name),
+        run: _macroTap(macro),
+      ),
+    for (final command in widget.quickCommands)
+      VoiceTarget(
+        kind: VoiceTargetKind.command,
+        id: command,
+        label: command,
+        enabled: _commandBarEnabled,
+        confirm: isExitLabel(command),
+        run: _commandTap(command),
+      ),
+  ];
+
+  @override
+  String get composerText => _composerController.text;
+
+  @override
+  void appendDictation(String text) => _appendComposerText(text);
+
+  @override
+  bool submitComposer() {
+    if (!_canSubmitComposer) return false;
+    _submitComposer();
+    return true;
+  }
+
+  @override
+  void clearComposer() => _composerController.clear();
+
+  @override
+  void composerBackspace(int count) =>
+      _setComposerText(backspaceText(_composerController.text, count));
+
+  @override
+  void composerDeleteWords(int count) =>
+      _setComposerText(deleteLastWords(_composerController.text, count));
+
+  @override
+  List<String> get terminalScreenLines {
+    final buffer = _terminal.buffer;
+    final rows = _terminal.viewHeight;
+    final scrollBack = buffer.height - rows;
+    var top = scrollBack < 0 ? 0 : scrollBack;
+    // Scrolled back through history: read the rows in view, not the bottom.
+    final scroll = _terminalScrollController;
+    if (top > 0 && scroll.hasClients && scroll.position.hasContentDimensions) {
+      final max = scroll.position.maxScrollExtent;
+      if (max > 0) {
+        final fraction = (scroll.position.pixels / max).clamp(0.0, 1.0);
+        top = (top * fraction).round();
+      }
+    }
+    final end = (top + rows).clamp(0, buffer.height);
+    return [
+      for (var i = top; i < end; i++)
+        buffer.lines[i].getText(0, _terminal.viewWidth),
+    ];
+  }
+
+  void _setComposerText(String text) {
+    _composerController.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+  }
+
+  Widget _buildVoiceStatusLine(ThemeData theme) {
+    final line = _voiceSession.statusLine;
+    if (line == null) return const SizedBox.shrink();
+    final scheme = theme.colorScheme;
+    final on = _voiceSession.enabled;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+      child: Row(
+        children: [
+          Icon(
+            on ? Icons.mic : Icons.mic_none,
+            size: 14,
+            color: on ? scheme.primary : scheme.onSurfaceVariant,
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              line,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.labelSmall,
+            ),
+          ),
+          if (on && _voiceSession.nativeState != null) ...[
+            const SizedBox(width: 8),
+            Text(
+              _voiceSession.nativeState!,
+              maxLines: 1,
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    final theme = Theme.of(context);
+    return SafeArea(
+      top: widget.fullscreen,
+      child: Column(
+        children: [
+          _buildConnectionPanel(theme),
+          _buildVoiceStatusLine(theme),
+          Expanded(
+            child: Listener(
+              onPointerDown: _handleTerminalPointerDown,
+              onPointerMove: _handleTerminalPointerMove,
+              onPointerUp: _handleTerminalPointerUp,
+              onPointerSignal: _handleTerminalPointerSignal,
+              child: Container(
+                color: Colors.black,
+                child: AbsorbPointer(
+                  absorbing: _tmuxScrollMode,
+                  child: TerminalView(
+                    _terminal,
+                    controller: _terminalController,
+                    focusNode: _terminalFocusNode,
+                    scrollController: _terminalScrollController,
+                    textStyle: TerminalStyle(fontSize: _terminalFontSize),
+                    autofocus: true,
+                    // Keystrokes (soft or hardware) would interleave with the
+                    // macro's own input, so the terminal is read-only until the
+                    // sequence finishes.
+                    readOnly: _tmuxScrollMode || _inputLocked,
+                    hardwareKeyboardOnly: _nativeKeyboardLocked,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          if (_inputLocked) _buildMacroRunBanner(theme),
+          _buildTerminalToolsHeader(theme),
+          if (_terminalToolsVisible) ...[
+            if (widget.sessionSelector != null && !_sessionBarFolded)
+              _macroLock(
+                _buildToolRow(theme, [
+                  _sessionToolBar(theme),
+                ], _sessionToolBar(theme)),
+              ),
+            _macroLock(_buildTerminalControlPad(theme)),
+            for (final row in _buildToolBarRows(theme)) _macroLock(row),
+          ],
+          _macroLock(_buildComposer()),
+        ],
+      ),
+    );
+  }
+
+  /// Makes an input surface inert while a macro runs. The buttons inside also
+  /// render themselves disabled; this additionally swallows taps that land in
+  /// the gaps between them, so nothing reaches the session mid-sequence.
+  Widget _macroLock(Widget child) {
+    if (!_inputLocked) return child;
+    return AbsorbPointer(child: Opacity(opacity: 0.55, child: child));
+  }
+
+  /// The "busy circle" every terminal control wears while a macro runs — the
+  /// same signal the macro buttons use, so no button in the pad or bars looks
+  /// tappable in the middle of a sequence.
+  Widget _macroBusySpinner({double size = 12, double strokeWidth = 2}) {
+    return SizedBox(
+      width: size,
+      height: size,
+      child: CircularProgressIndicator(strokeWidth: strokeWidth),
+    );
+  }
+
+  Widget _buildMacroRunBanner(ThemeData theme) {
+    final scheme = theme.colorScheme;
+    final progress = _macroProgress();
+    final fraction = progress?.fraction;
+    return Material(
+      color: scheme.tertiaryContainer,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: scheme.onTertiaryContainer,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _macroStopRequested
+                            ? 'Stopping macro'
+                            : 'Macro running — controls are locked',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.labelMedium?.copyWith(
+                          fontWeight: FontWeight.w700,
+                          color: scheme.onTertiaryContainer,
+                        ),
+                      ),
+                      Text(
+                        '${_watch.progress ?? _macroRunningName ?? 'Macro'}  •  '
+                        '${progress?.stepLabel ?? ''}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: scheme.onTertiaryContainer.withValues(
+                            alpha: 0.8,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 6),
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    foregroundColor: scheme.onTertiaryContainer,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  icon: const Icon(Icons.stop_circle_outlined, size: 18),
+                  label: const Text('Stop'),
+                  onPressed: _macroStopRequested ? null : _requestMacroStop,
+                ),
+              ],
+            ),
+          ),
+          LinearProgressIndicator(
+            value: fraction,
+            minHeight: 2,
+            backgroundColor: scheme.onTertiaryContainer.withValues(alpha: 0.15),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConnectionPanel(ThemeData theme) {
+    final connectionLabel = _host.isEmpty
+        ? 'No SSH host saved'
+        : '${_username.isEmpty ? 'user' : _username}@$_host:$_port';
+    final subtitle = _status ?? connectionLabel;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 6, 8, 4),
+      child: Material(
+        color: theme.colorScheme.surface,
+        elevation: 1,
+        borderRadius: BorderRadius.circular(8),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(10, 6, 4, 6),
+          child: Row(
+            children: [
+              Icon(
+                _connected ? Icons.link : Icons.link_off,
+                size: 20,
+                color: _connected ? theme.colorScheme.primary : null,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      _connected ? 'SSH connected' : connectionLabel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelLarge,
+                    ),
+                    Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              _terminalPanelIconButton(
+                icon: Icon(_connected ? Icons.link_off : Icons.link),
+                tooltip: _connected ? 'Disconnect' : 'Connect',
+                onPressed: _busy
+                    ? null
+                    : () => _connected ? _disconnect() : _connect(),
+              ),
+              if (defaultTargetPlatform == TargetPlatform.android)
+                _terminalPanelIconButton(
+                  icon: Icon(
+                    _voiceSession.enabled ? Icons.mic : Icons.mic_none,
+                  ),
+                  tooltip: _voiceSession.enabled
+                      ? 'Voice control on'
+                      : 'Voice control off',
+                  selected: _voiceSession.enabled,
+                  onPressed: _voiceSession.starting
+                      ? null
+                      : () => unawaited(_toggleVoiceControl()),
+                ),
+              _buildTerminalFontControls(theme),
+              _terminalPanelIconButton(
+                icon: Icon(
+                  _nativeKeyboardLocked ? Icons.keyboard_hide : Icons.keyboard,
+                ),
+                tooltip: _nativeKeyboardLocked
+                    ? 'Native keyboard locked off'
+                    : 'Native keyboard allowed',
+                selected: _nativeKeyboardLocked,
+                onPressed: () =>
+                    _setNativeKeyboardLocked(!_nativeKeyboardLocked),
+              ),
+              _terminalPanelIconButton(
+                icon: Icon(
+                  widget.fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
+                ),
+                tooltip: widget.fullscreen
+                    ? 'Show DevOTA tabs'
+                    : 'Hide DevOTA tabs',
+                selected: widget.fullscreen,
+                onPressed: widget.onFullscreenChanged == null
+                    ? null
+                    : () => widget.onFullscreenChanged!(!widget.fullscreen),
+              ),
+              _terminalPanelIconButton(
+                icon: const Icon(Icons.settings),
+                tooltip: 'SSH settings',
+                onPressed: _showConnectionSheet,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _terminalPanelIconButton({
+    required Widget icon,
+    required String tooltip,
+    required VoidCallback? onPressed,
+    bool selected = false,
+  }) {
+    final theme = Theme.of(context);
+    return Tooltip(
+      message: tooltip,
+      child: IconButton(
+        visualDensity: VisualDensity.compact,
+        style: IconButton.styleFrom(
+          fixedSize: const Size(34, 34),
+          minimumSize: const Size(34, 34),
+          padding: EdgeInsets.zero,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          backgroundColor: selected
+              ? theme.colorScheme.secondaryContainer
+              : null,
+          foregroundColor: selected
+              ? theme.colorScheme.onSecondaryContainer
+              : null,
+        ),
+        icon: icon,
+        onPressed: onPressed,
+      ),
+    );
+  }
+
+  Widget _buildTerminalFontControls(ThemeData theme) {
+    final borderColor = theme.colorScheme.outlineVariant;
+    return Container(
+      height: 32,
+      margin: const EdgeInsets.symmetric(horizontal: 2),
+      decoration: BoxDecoration(
+        border: Border.all(color: borderColor),
+        borderRadius: BorderRadius.circular(18),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _fontControlButton(
+            icon: Icons.zoom_in,
+            tooltip: 'Increase terminal font',
+            onPressed: () => _adjustTerminalFontSize(1.1),
+          ),
+          _fontControlDivider(borderColor),
+          Tooltip(
+            message: 'Reset terminal font',
+            child: InkWell(
+              onTap: _resetTerminalFontSize,
+              child: SizedBox(
+                width: 34,
+                height: 32,
+                child: Center(
+                  child: Text(
+                    _terminalFontSize.round().toString(),
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          _fontControlDivider(borderColor),
+          _fontControlButton(
+            icon: Icons.zoom_out,
+            tooltip: 'Decrease terminal font',
+            onPressed: () => _adjustTerminalFontSize(1 / 1.1),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _fontControlButton({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onPressed,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onPressed,
+        child: SizedBox(width: 32, height: 32, child: Icon(icon, size: 18)),
+      ),
+    );
+  }
+
+  Widget _fontControlDivider(Color color) {
+    return SizedBox(width: 1, height: 20, child: ColoredBox(color: color));
+  }
+
+  Future<void> _showConnectionSheet() async {
+    if (_profiles == null) {
+      await (_profileLoad ??= _loadProfile());
+      if (!mounted || _profiles == null) return;
+    }
+    var sheetBusy = false;
+    final theme = Theme.of(context);
+    final openNotificationControls = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final bottomInset = MediaQuery.viewInsetsOf(ctx).bottom;
+            final profileEnabled =
+                !sheetBusy && !_busy && !_profileBusy && !_inputLocked;
+            Future<void> sheetAction(Future<void> Function() action) async {
+              setSheetState(() => sheetBusy = true);
+              try {
+                await action();
+              } finally {
+                if (ctx.mounted) setSheetState(() => sheetBusy = false);
+              }
+            }
+
+            return Padding(
+              padding: EdgeInsets.fromLTRB(12, 12, 12, 12 + bottomInset),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Text(
+                          'SSH Settings',
+                          style: theme.textTheme.titleMedium,
+                        ),
+                        const Spacer(),
+                        IconButton(
+                          icon: const Icon(Icons.close),
+                          tooltip: 'Close',
+                          onPressed: () => Navigator.pop(ctx),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    if (widget.onSelectProfile == null) ...[
+                      DropdownButtonFormField<String>(
+                        key: ValueKey(_currentProfile.id),
+                        initialValue: _currentProfile.id,
+                        isExpanded: true,
+                        decoration: const InputDecoration(
+                          labelText: 'Terminal profile',
+                          border: OutlineInputBorder(),
+                        ),
+                        items: _profiles!.profiles
+                            .map(
+                              (profile) => DropdownMenuItem(
+                                value: profile.id,
+                                child: Text(
+                                  profile.name,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            )
+                            .toList(),
+                        onChanged: profileEnabled
+                            ? (id) {
+                                if (id != null) {
+                                  sheetAction(() => _selectTerminalProfile(id));
+                                }
+                              }
+                            : null,
+                      ),
+                      Wrap(
+                        spacing: 8,
+                        children: [
+                          TextButton.icon(
+                            onPressed: profileEnabled
+                                ? () => sheetAction(
+                                    () => _nameTerminalProfile(create: true),
+                                  )
+                                : null,
+                            icon: const Icon(Icons.add),
+                            label: const Text('New profile'),
+                          ),
+                          TextButton.icon(
+                            onPressed: profileEnabled
+                                ? () => sheetAction(_nameTerminalProfile)
+                                : null,
+                            icon: const Icon(Icons.edit),
+                            label: const Text('Rename'),
+                          ),
+                        ],
+                      ),
+                    ],
+                    Text(
+                      widget.onSelectProfile == null
+                          ? 'Switching profiles saves settings and disconnects the current session. Tap Connect for the selected computer.'
+                          : 'Computer: ${_currentProfile.name}. Manage computers in Connect.',
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _field(
+                            _hostController,
+                            'Host',
+                            enabled: profileEnabled && !_connected,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        SizedBox(
+                          width: 86,
+                          child: _field(
+                            _portController,
+                            'Port',
+                            enabled: profileEnabled && !_connected,
+                            keyboardType: TextInputType.number,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    _field(
+                      _usernameController,
+                      'User',
+                      enabled: profileEnabled && !_connected,
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _usePrivateKey
+                              ? TextField(
+                                  controller: _passphraseController,
+                                  enabled: profileEnabled && !_connected,
+                                  obscureText: true,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Key passphrase',
+                                    border: OutlineInputBorder(),
+                                    isDense: true,
+                                  ),
+                                  onChanged: (_) => _saveProfile(),
+                                )
+                              : TextField(
+                                  controller: _passwordController,
+                                  enabled: profileEnabled && !_connected,
+                                  obscureText: true,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Password',
+                                    border: OutlineInputBorder(),
+                                    isDense: true,
+                                  ),
+                                  onChanged: (_) => _saveProfile(),
+                                ),
+                        ),
+                        const SizedBox(width: 8),
+                        FilterChip(
+                          label: const Text('Key'),
+                          selected: _usePrivateKey,
+                          onSelected: profileEnabled && !_connected
+                              ? (v) {
+                                  // Drive the sheet only; the parent repaints once the
+                                  // sheet closes (avoids a cross-tree setState during
+                                  // teardown — see _showControlPadSettingsSheet).
+                                  setSheetState(() => _usePrivateKey = v);
+                                  _saveProfile();
+                                }
+                              : null,
+                        ),
+                        const SizedBox(width: 4),
+                        IconButton.filledTonal(
+                          icon: const Icon(Icons.key),
+                          tooltip: _privateKeyName ?? 'Import private key',
+                          onPressed: profileEnabled && !_connected
+                              ? () => sheetAction(_pickPrivateKey)
+                              : null,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        FilledButton.icon(
+                          icon: Icon(_connected ? Icons.link_off : Icons.link),
+                          label: Text(_connected ? 'Disconnect' : 'Connect'),
+                          onPressed: sheetBusy || _busy || _profileBusy
+                              ? null
+                              : () => sheetAction(
+                                  () => _connected ? _disconnect() : _connect(),
+                                ),
+                        ),
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.network_ping),
+                          label: const Text('Ping'),
+                          onPressed: sheetBusy || _busy || _profileBusy
+                              ? null
+                              : () => sheetAction(_ping),
+                        ),
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.add),
+                          label: const Text('Key'),
+                          onPressed: profileEnabled && !_connected
+                              ? () => sheetAction(_generateTerminalKey)
+                              : null,
+                        ),
+                        IconButton.filledTonal(
+                          icon: const Icon(Icons.copy),
+                          tooltip: 'Copy generated public key',
+                          onPressed: _generatedPublicKey == null
+                              ? null
+                              : _copyPublicKey,
+                        ),
+                        IconButton.filledTonal(
+                          icon: const Icon(Icons.upload),
+                          tooltip: 'Install public key through build server',
+                          onPressed: _busy || _generatedPublicKey == null
+                              ? null
+                              : _sendPublicKeyToServer,
+                        ),
+                        IconButton.filledTonal(
+                          icon: const Icon(Icons.key),
+                          tooltip: 'Set OpenAI key',
+                          onPressed: _promptApiKey,
+                        ),
+                      ],
+                    ),
+                    const Divider(height: 20),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.notifications_active_outlined),
+                      title: const Text('Notification macros'),
+                      subtitle: const Text(
+                        'Window status, Run macro and Send Enter',
+                      ),
+                      onTap: !_connected || _inputLocked
+                          ? null
+                          : () {
+                              Navigator.pop(ctx, true);
+                            },
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      title: const Text('Stay connected in the background'),
+                      subtitle: const Text(
+                        'Runs an ongoing notification so Android does not '
+                        'freeze the session when you switch apps.',
+                      ),
+                      value: _keepAliveInBackground,
+                      onChanged: (v) {
+                        setSheetState(() => _keepAliveInBackground = v);
+                        unawaited(_setKeepAliveInBackground(v));
+                      },
+                    ),
+                    if (Platform.isAndroid)
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        dense: true,
+                        title: const Text('Voice control: quiet restart beeps'),
+                        subtitle: const Text(
+                          'Mutes media while the recognizer restarts, only '
+                          'when nothing else is playing.',
+                        ),
+                        value: _voiceSession.quietBeeps,
+                        onChanged: (v) {
+                          setSheetState(() => _voiceSession.quietBeeps = v);
+                          unawaited(_setVoiceQuietBeeps(v));
+                        },
+                      ),
+                    if (_keepAliveInBackground &&
+                        !_batteryOptimizationExempt &&
+                        Platform.isAndroid)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.battery_alert,
+                              size: 18,
+                              color: theme.colorScheme.error,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                'Battery optimization can still drop idle '
+                                'sessions with the screen off.',
+                                style: theme.textTheme.bodySmall,
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: () async {
+                                await BackgroundSessionService.requestBatteryOptimizationExemption();
+                                final exempt =
+                                    await BackgroundSessionService.isBatteryOptimizationExempt();
+                                if (!mounted) return;
+                                setState(
+                                  () => _batteryOptimizationExempt = exempt,
+                                );
+                                setSheetState(() {});
+                              },
+                              child: const Text('Fix'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    if (_status != null) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        _status!,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+    if (mounted) {
+      setState(() {});
+      if (openNotificationControls == true) await _showNotificationControls();
+    }
+  }
+
+  Widget _buildTerminalToolsHeader(ThemeData theme) {
+    return Material(
+      color: theme.colorScheme.surfaceContainer,
+      child: InkWell(
+        onTap: _toggleTerminalTools,
+        child: SizedBox(
+          height: 34,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              children: [
+                Icon(
+                  _terminalToolsVisible
+                      ? Icons.keyboard_arrow_down
+                      : Icons.keyboard_arrow_right,
+                  size: 20,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  'Tools',
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _terminalToolsVisible
+                        ? 'Terminal, tmux, macros, commands'
+                        : 'Tap to show terminal controls',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                if (_tmuxScrollMode)
+                  TextButton(
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    onPressed: _exitTmuxScrollMode,
+                    child: const Text('Exit scroll'),
+                  ),
+                if (_terminalToolsVisible)
+                  IconButton(
+                    icon: const Icon(Icons.tune, size: 20),
+                    visualDensity: VisualDensity.compact,
+                    tooltip: 'Customize control pad',
+                    onPressed: _showControlPadSettingsSheet,
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTerminalControlPad(ThemeData theme) {
+    return Material(
+      color: theme.colorScheme.surfaceContainerHighest,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
+        child: Row(
+          children: [
+            _buildArrowCluster(theme),
+            const SizedBox(width: 6),
+            Expanded(
+              child: SizedBox(
+                height: 64,
+                child: Column(
+                  children: [
+                    Expanded(child: _buildPadRow(0)),
+                    const SizedBox(height: 4),
+                    Expanded(child: _buildPadRow(1)),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Built-in control-pad keys, in their catalog order. Sequences are stored as
+  /// the literal characters to send; special ids (`esc`, `attach_file`, `slash`)
+  /// are handled in [_runPadKeyAction].
+  static const List<TerminalPadKey> _builtinPadKeys = [
+    TerminalPadKey(
+      id: 'tab',
+      abbreviation: 'Tab',
+      name: 'Tab',
+      sequence: '\t',
+      builtin: true,
+    ),
+    TerminalPadKey(
+      id: 'esc',
+      abbreviation: 'Esc',
+      name: 'Escape',
+      sequence: '\x1B',
+      builtin: true,
+    ),
+    TerminalPadKey(
+      id: 'ctrl_c',
+      abbreviation: 'C-c',
+      name: 'Ctrl-C',
+      sequence: '\x03',
+      builtin: true,
+    ),
+    TerminalPadKey(
+      id: 'slash',
+      abbreviation: '/',
+      name: 'Slash',
+      sequence: '/',
+      builtin: true,
+      enabledWhenDisconnected: true,
+    ),
+    TerminalPadKey(
+      id: 'attach_file',
+      abbreviation: '+',
+      name: 'Attach file',
+      iconName: 'add',
+      builtin: true,
+      enabledWhenDisconnected: true,
+    ),
+    TerminalPadKey(
+      id: 'home',
+      abbreviation: 'Home',
+      name: 'Home',
+      sequence: '\x1B[H',
+      builtin: true,
+    ),
+    TerminalPadKey(
+      id: 'end',
+      abbreviation: 'End',
+      name: 'End',
+      sequence: '\x1B[F',
+      builtin: true,
+    ),
+    TerminalPadKey(
+      id: 'page_up',
+      abbreviation: 'PgUp',
+      name: 'Page Up',
+      sequence: '\x1B[5~',
+      builtin: true,
+    ),
+    TerminalPadKey(
+      id: 'page_down',
+      abbreviation: 'PgDn',
+      name: 'Page Down',
+      sequence: '\x1B[6~',
+      builtin: true,
+    ),
+    TerminalPadKey(
+      id: 'backspace',
+      abbreviation: 'BkSp',
+      name: 'Backspace',
+      iconName: 'backspace',
+      sequence: '\x7F',
+      builtin: true,
+    ),
+    TerminalPadKey(
+      id: 'enter',
+      abbreviation: 'Ent',
+      name: 'Enter',
+      iconName: 'enter',
+      sequence: '\r',
+      builtin: true,
+    ),
+  ];
+
+  /// Every key that can be placed on the pad: built-ins plus the user's customs.
+  List<TerminalPadKey> get _allPadKeys => [
+    ..._builtinPadKeys,
+    ..._padConfig.customKeys,
+  ];
+
+  TerminalPadKey? _padKeyById(String id) {
+    for (final key in _builtinPadKeys) {
+      if (key.id == id) return key;
+    }
+    for (final key in _padConfig.customKeys) {
+      if (key.id == id) return key;
+    }
+    return null;
+  }
+
+  IconData? _padKeyIcon(String? iconName) {
+    switch (iconName) {
+      case 'add':
+        return Icons.add;
+      case 'backspace':
+        return Icons.backspace_outlined;
+      case 'enter':
+        return Icons.keyboard_return;
+    }
+    return null;
+  }
+
+  /// The middle keys of [row] resolved to key objects, in display order (manual
+  /// order, or descending use count when [TerminalPadRowConfig.sortByFrequency]).
+  List<TerminalPadKey> _resolvedRowKeys(TerminalPadRowConfig row) {
+    final keys = <TerminalPadKey>[];
+    for (final id in row.middleIds) {
+      final key = _padKeyById(id);
+      if (key != null) keys.add(key);
+    }
+    if (!row.sortByFrequency) return keys;
+    final indexed = [
+      for (var i = 0; i < keys.length; i++) MapEntry(i, keys[i]),
+    ];
+    indexed.sort((a, b) {
+      final byUse = (_terminalKeyUseCounts[b.value.id] ?? 0).compareTo(
+        _terminalKeyUseCounts[a.value.id] ?? 0,
+      );
+      return byUse != 0 ? byUse : a.key.compareTo(b.key);
+    });
+    return [for (final entry in indexed) entry.value];
+  }
+
+  void _activateTerminalPadKey(TerminalPadKey key) {
+    _activateTerminalKeyButton(key.id, () => _runPadKeyAction(key));
+  }
+
+  void _runPadKeyAction(TerminalPadKey key) {
+    switch (key.id) {
+      case 'esc':
+        if (_tmuxScrollMode) {
+          _exitTmuxScrollModeWithEsc();
+        } else {
+          _sendTerminalKey('\x1B');
+        }
+      case 'attach_file':
+        unawaited(_attachFileToTerminal());
+      case 'slash':
+        _sendTerminalKey('/', fallbackText: '/');
+      default:
+        final sequence = decodeKeySequence(key.sequence);
+        if (sequence.isNotEmpty) _sendTerminalKey(sequence);
+    }
+  }
+
+  Widget _buildPadRow(int rowIndex) {
+    final row = _padConfig.rows[rowIndex];
+    final fixed = row.fixedRightId == null
+        ? null
+        : _padKeyById(row.fixedRightId!);
+    return Row(
+      children: [
+        Expanded(child: _buildPadScrollRow(rowIndex)),
+        if (fixed != null) ...[
+          const SizedBox(width: 4),
+          _buildPadFixedRightButton(fixed),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildPadScrollRow(int rowIndex) {
+    final keys = _resolvedRowKeys(_padConfig.rows[rowIndex]);
+    if (keys.isEmpty) return const SizedBox.shrink();
+    return ListView.separated(
+      scrollDirection: Axis.horizontal,
+      padding: EdgeInsets.zero,
+      physics: const ClampingScrollPhysics(),
+      itemCount: keys.length,
+      separatorBuilder: (_, _) => const SizedBox(width: 4),
+      itemBuilder: (_, index) => Center(child: _buildPadKeyPill(keys[index])),
+    );
+  }
+
+  Widget _buildPadKeyPill(TerminalPadKey key) {
+    final enabled =
+        (_connected || key.enabledWhenDisconnected) && !_inputLocked;
+    final icon = _padKeyIcon(key.iconName);
+    final button = SizedBox(
+      height: 30,
+      child: OutlinedButton(
+        style: OutlinedButton.styleFrom(
+          visualDensity: VisualDensity.compact,
+          minimumSize: const Size(34, 30),
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        onPressed: enabled ? _padKeyTap(key) : null,
+        child: icon != null
+            ? Icon(icon, size: 16)
+            : Text(key.abbreviation, maxLines: 1),
+      ),
+    );
+    return Tooltip(message: key.name, child: button);
+  }
+
+  Widget _buildPadFixedRightButton(TerminalPadKey key) {
+    final enabled =
+        (_connected || key.enabledWhenDisconnected) && !_inputLocked;
+    final icon = _padKeyIcon(key.iconName);
+    return Tooltip(
+      message: key.name,
+      child: Semantics(
+        button: true,
+        label: key.name,
+        child: SizedBox(
+          height: 30,
+          child: OutlinedButton(
+            style: OutlinedButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              minimumSize: const Size(30, 30),
+              padding: EdgeInsets.symmetric(horizontal: icon != null ? 0 : 8),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            onPressed: enabled ? _padKeyTap(key) : null,
+            child: icon != null
+                ? Icon(icon, size: 18)
+                : Text(key.abbreviation, maxLines: 1),
+          ),
+        ),
+      ),
+    );
+  }
+
+  static const _arrowKeys = <_ArrowKey>[
+    _ArrowKey(
+      'up',
+      Icons.keyboard_arrow_up,
+      'Up',
+      '\x1B[A',
+      Alignment.topCenter,
+    ),
+    _ArrowKey(
+      'left',
+      Icons.keyboard_arrow_left,
+      'Left',
+      '\x1B[D',
+      Alignment.bottomLeft,
+    ),
+    _ArrowKey(
+      'down',
+      Icons.keyboard_arrow_down,
+      'Down',
+      '\x1B[B',
+      Alignment.bottomCenter,
+    ),
+    _ArrowKey(
+      'right',
+      Icons.keyboard_arrow_right,
+      'Right',
+      '\x1B[C',
+      Alignment.bottomRight,
+    ),
+  ];
+
+  Widget _buildArrowCluster(ThemeData theme) {
+    return SizedBox(
+      width: 94,
+      height: 64,
+      child: Stack(
+        children: [
+          if (widget.sessionSelector != null && _sessionBarFolded)
+            Align(
+              alignment: Alignment.topLeft,
+              child: Tooltip(
+                message: 'Sessions',
+                child: InkWell(
+                  onTap: () => _toggleBarFold('sessions'),
+                  onLongPress: () => _toggleBarFold('sessions'),
+                  borderRadius: BorderRadius.circular(6),
+                  child: SizedBox(
+                    width: 30,
+                    height: 30,
+                    child: Icon(
+                      Icons.computer,
+                      size: 16,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          for (final arrow in _arrowKeys)
+            Align(alignment: arrow.align, child: _terminalArrowButton(arrow)),
+        ],
+      ),
+    );
+  }
+
+  Widget _terminalArrowButton(_ArrowKey arrow) {
+    return Tooltip(
+      message: arrow.tooltip,
+      child: IconButton.filledTonal(
+        visualDensity: VisualDensity.compact,
+        style: IconButton.styleFrom(
+          fixedSize: const Size(30, 30),
+          minimumSize: const Size(30, 30),
+          padding: EdgeInsets.zero,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        icon: Icon(arrow.icon, size: 20),
+        onPressed: _connected && !_inputLocked ? _arrowTap(arrow) : null,
+      ),
+    );
+  }
+
+  // --- Control-pad customization -------------------------------------------
+
+  Set<String> _allPlacedKeyIds() {
+    final placed = <String>{};
+    for (final row in _padConfig.rows) {
+      placed.addAll(row.middleIds);
+      if (row.fixedRightId != null) placed.add(row.fixedRightId!);
+    }
+    return placed;
+  }
+
+  String _nextCustomKeyId() {
+    var max = 0;
+    for (final key in _padConfig.customKeys) {
+      if (key.id.startsWith('custom:')) {
+        final n = int.tryParse(key.id.substring('custom:'.length)) ?? 0;
+        if (n > max) max = n;
+      }
+    }
+    return 'custom:${max + 1}';
+  }
+
+  // Each mutator changes _padConfig in place; callers wrap them in the sheet's
+  // applyConfig() so the pad rebuilds and the config persists. A key id appears
+  // at most once across both rows, so placing a key removes it from anywhere
+  // else first.
+  void _padUnplaceKey(String id) {
+    for (final row in _padConfig.rows) {
+      row.middleIds.remove(id);
+      if (row.fixedRightId == id) row.fixedRightId = null;
+    }
+  }
+
+  void _padAddToRow(int rowIndex, String id) {
+    _padUnplaceKey(id);
+    _padConfig.rows[rowIndex].middleIds.add(id);
+  }
+
+  void _padSetFixedRight(int rowIndex, String? id) {
+    if (id != null) _padUnplaceKey(id);
+    _padConfig.rows[rowIndex].fixedRightId = id;
+  }
+
+  void _padMoveKey(int rowIndex, int index, int delta) {
+    final ids = _padConfig.rows[rowIndex].middleIds;
+    final target = index + delta;
+    if (target < 0 || target >= ids.length) return;
+    final id = ids.removeAt(index);
+    ids.insert(target, id);
+  }
+
+  void _replaceCustomKey(TerminalPadKey edited) {
+    final i = _padConfig.customKeys.indexWhere((k) => k.id == edited.id);
+    if (i >= 0) _padConfig.customKeys[i] = edited;
+  }
+
+  void _deleteCustomKey(String id) {
+    _padUnplaceKey(id);
+    _padConfig.customKeys.removeWhere((k) => k.id == id);
+  }
+
+  Future<void> _showControlPadSettingsSheet() async {
+    final theme = Theme.of(context);
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            void applyConfig(void Function() mutate) {
+              // Rebuild ONLY the sheet here. Calling the parent State's
+              // setState while a nested route (the custom-key editor dialog or
+              // the "Add" popup menu) is dismounting deactivates an
+              // InheritedElement that the closing route still depends on, which
+              // trips Flutter's `_dependents.isEmpty` assertion. The live pad
+              // behind the sheet is refreshed once, after the sheet closes.
+              setSheetState(mutate);
+              unawaited(_saveTerminalPadConfig());
+            }
+
+            final bottomInset = MediaQuery.viewInsetsOf(ctx).bottom;
+            return Padding(
+              padding: EdgeInsets.fromLTRB(12, 12, 12, 12 + bottomInset),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Text(
+                          'Control pad buttons',
+                          style: theme.textTheme.titleMedium,
+                        ),
+                        const Spacer(),
+                        IconButton(
+                          icon: const Icon(Icons.close),
+                          onPressed: () => Navigator.pop(ctx),
+                        ),
+                      ],
+                    ),
+                    Text(
+                      'The arrow keys and the two right-pinned keys stay fixed. '
+                      'The buttons in between scroll horizontally.',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _buildPadRowSettings(theme, 0, 'Top row', applyConfig),
+                    const Divider(height: 28),
+                    _buildPadRowSettings(theme, 1, 'Bottom row', applyConfig),
+                    const Divider(height: 28),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        icon: const Icon(Icons.restore),
+                        label: const Text('Reset to defaults'),
+                        onPressed: () => applyConfig(
+                          () => _padConfig = TerminalPadConfig.defaults(),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+    // The sheet edited _padConfig in place; repaint the live control pad now
+    // that the sheet (and any nested dialogs) are fully gone.
+    if (mounted) setState(() {});
+  }
+
+  Widget _buildPadRowSettings(
+    ThemeData theme,
+    int rowIndex,
+    String title,
+    void Function(void Function()) applyConfig,
+  ) {
+    final row = _padConfig.rows[rowIndex];
+    final middleKeys = _resolvedRowKeys(row);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: theme.textTheme.titleSmall),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            Text('Pinned right:', style: theme.textTheme.bodyMedium),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _buildFixedRightSelector(theme, rowIndex, applyConfig),
+            ),
+          ],
+        ),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          title: const Text('Sort by frequency of use'),
+          value: row.sortByFrequency,
+          onChanged: (value) => applyConfig(
+            () => _padConfig.rows[rowIndex].sortByFrequency = value,
+          ),
+        ),
+        for (var i = 0; i < middleKeys.length; i++)
+          _buildPadKeySettingsTile(
+            theme,
+            rowIndex,
+            i,
+            middleKeys[i],
+            middleKeys.length,
+            row.sortByFrequency,
+            applyConfig,
+          ),
+        if (middleKeys.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text(
+              'No scrollable buttons in this row.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        const SizedBox(height: 4),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: _buildAddKeyControl(theme, rowIndex, applyConfig),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFixedRightSelector(
+    ThemeData theme,
+    int rowIndex,
+    void Function(void Function()) applyConfig,
+  ) {
+    const noneValue = '__none__';
+    final current = _padConfig.rows[rowIndex].fixedRightId ?? noneValue;
+    final items = <DropdownMenuItem<String>>[
+      const DropdownMenuItem(value: noneValue, child: Text('None')),
+      for (final key in _allPadKeys)
+        DropdownMenuItem(
+          value: key.id,
+          child: Text(
+            '${key.abbreviation} — ${key.name}',
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+    ];
+    final value = items.any((item) => item.value == current)
+        ? current
+        : noneValue;
+    return DropdownButton<String>(
+      isExpanded: true,
+      value: value,
+      items: items,
+      onChanged: (selected) => applyConfig(
+        () => _padSetFixedRight(
+          rowIndex,
+          selected == noneValue ? null : selected,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPadKeySettingsTile(
+    ThemeData theme,
+    int rowIndex,
+    int index,
+    TerminalPadKey key,
+    int count,
+    bool sortByFrequency,
+    void Function(void Function()) applyConfig,
+  ) {
+    final icon = _padKeyIcon(key.iconName);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 46,
+            child: icon != null
+                ? Icon(icon, size: 18)
+                : Text(
+                    key.abbreviation,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelLarge,
+                  ),
+          ),
+          Expanded(
+            child: Text(
+              key.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodyMedium,
+            ),
+          ),
+          if (!sortByFrequency) ...[
+            IconButton(
+              icon: const Icon(Icons.arrow_upward, size: 18),
+              visualDensity: VisualDensity.compact,
+              tooltip: 'Move up',
+              onPressed: index == 0
+                  ? null
+                  : () => applyConfig(() => _padMoveKey(rowIndex, index, -1)),
+            ),
+            IconButton(
+              icon: const Icon(Icons.arrow_downward, size: 18),
+              visualDensity: VisualDensity.compact,
+              tooltip: 'Move down',
+              onPressed: index == count - 1
+                  ? null
+                  : () => applyConfig(() => _padMoveKey(rowIndex, index, 1)),
+            ),
+          ],
+          if (!key.builtin)
+            IconButton(
+              icon: const Icon(Icons.edit_outlined, size: 18),
+              visualDensity: VisualDensity.compact,
+              tooltip: 'Edit',
+              onPressed: () async {
+                final result = await _showCustomPadKeyEditor(existing: key);
+                if (result == null) return;
+                applyConfig(() {
+                  if (result.deleted) {
+                    _deleteCustomKey(key.id);
+                  } else if (result.saved != null) {
+                    _replaceCustomKey(result.saved!);
+                  }
+                });
+              },
+            ),
+          IconButton(
+            icon: const Icon(Icons.close, size: 18),
+            visualDensity: VisualDensity.compact,
+            tooltip: 'Remove from row',
+            onPressed: () => applyConfig(() => _padUnplaceKey(key.id)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAddKeyControl(
+    ThemeData theme,
+    int rowIndex,
+    void Function(void Function()) applyConfig,
+  ) {
+    final placed = _allPlacedKeyIds();
+    final available = _allPadKeys
+        .where((key) => !placed.contains(key.id))
+        .toList();
+    return PopupMenuButton<String>(
+      tooltip: 'Add a button',
+      onSelected: (value) async {
+        if (value == '__custom__') {
+          final result = await _showCustomPadKeyEditor();
+          if (result?.saved == null) return;
+          applyConfig(() {
+            _padConfig.customKeys.add(result!.saved!);
+            _padAddToRow(rowIndex, result.saved!.id);
+          });
+        } else {
+          applyConfig(() => _padAddToRow(rowIndex, value));
+        }
+      },
+      itemBuilder: (ctx) => [
+        for (final key in available)
+          PopupMenuItem(
+            value: key.id,
+            child: Text('${key.abbreviation} — ${key.name}'),
+          ),
+        if (available.isNotEmpty) const PopupMenuDivider(),
+        const PopupMenuItem(value: '__custom__', child: Text('Custom…')),
+      ],
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          border: Border.all(color: theme.colorScheme.outline),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.add, size: 18),
+            SizedBox(width: 4),
+            Text('Add button'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<({TerminalPadKey? saved, bool deleted})?> _showCustomPadKeyEditor({
+    TerminalPadKey? existing,
+  }) {
+    // Delegate to a dedicated StatefulWidget dialog that owns its text
+    // controllers and disposes them in its own dispose() — disposing them here
+    // (right after the await) tears them down while the dialog is still
+    // animating out, which throws and cascades into framework assertions.
+    return _CustomPadKeyDialog.show(
+      context,
+      existing: existing,
+      newId: _nextCustomKeyId(),
+    );
+  }
+
+  void _toggleBarFold(String id) {
+    setState(() {
+      switch (id) {
+        case 'sessions':
+          _sessionBarFolded = !_sessionBarFolded;
+        case 'tmux':
+          _tmuxBarFolded = !_tmuxBarFolded;
+        case 'macros':
+          _macroBarFolded = !_macroBarFolded;
+        case 'cmds':
+          _commandBarFolded = !_commandBarFolded;
+      }
+    });
+  }
+
+  // Builds the tmux / macros / cmds bars, collapsing folded ones. Consecutive
+  // folded bars contribute only their (stacked) label to the next visible bar's
+  // row; a trailing folded group with no visible bar after it becomes a
+  // label-only row. See the fold behaviour in the terminal tools.
+  _ToolBar _sessionToolBar(ThemeData theme) => _ToolBar(
+    id: 'sessions',
+    label: 'sessions',
+    background: theme.colorScheme.surfaceContainerLow,
+    enabled: _sessionBarEnabled,
+    folded: _sessionBarFolded,
+    onToggle: () => setState(() => _sessionBarEnabled = !_sessionBarEnabled),
+    onToggleFold: () => _toggleBarFold('sessions'),
+    buildContent: () => Align(
+      alignment: Alignment.centerLeft,
+      child: IgnorePointer(
+        ignoring: !_sessionBarEnabled,
+        child: Opacity(
+          opacity: _sessionBarEnabled ? 1 : 0.4,
+          child: widget.sessionSelector!,
+        ),
+      ),
+    ),
+  );
+
+  List<Widget> _buildToolBarRows(ThemeData theme) {
+    final bars = <_ToolBar>[
+      _ToolBar(
+        id: 'tmux',
+        label: 'tmux',
+        background: theme.colorScheme.surfaceContainerHighest,
+        enabled: _tmuxBarEnabled,
+        folded: _tmuxBarFolded,
+        onToggle: () => setState(() => _tmuxBarEnabled = !_tmuxBarEnabled),
+        onToggleFold: () => _toggleBarFold('tmux'),
+        buildContent: () => _buildTmuxContent(theme),
+      ),
+      if (widget.quickMacros.isNotEmpty)
+        _ToolBar(
+          id: 'macros',
+          label: 'macros',
+          background: theme.colorScheme.surfaceContainerLow,
+          enabled: _macroBarEnabled,
+          folded: _macroBarFolded,
+          onToggle: () => setState(() => _macroBarEnabled = !_macroBarEnabled),
+          onToggleFold: () => _toggleBarFold('macros'),
+          buildContent: () => _buildMacroContent(theme),
+        ),
+      if (widget.quickCommands.isNotEmpty)
+        _ToolBar(
+          id: 'cmds',
+          label: 'cmds',
+          background: theme.colorScheme.surfaceContainerLow,
+          enabled: _commandBarEnabled,
+          folded: _commandBarFolded,
+          onToggle: () =>
+              setState(() => _commandBarEnabled = !_commandBarEnabled),
+          onToggleFold: () => _toggleBarFold('cmds'),
+          buildContent: () => _buildCommandContent(theme),
+        ),
+    ];
+
+    // Group bars into rows. Each unfolded bar owns a row (its content shows on
+    // the right). A folded bar has no row of its own — its label stacks
+    // vertically into the nearest unfolded bar's row: the one above it, or, for a
+    // leading run of folded bars, the first unfolded bar below. Only when every
+    // bar is folded is there a content-less row, drawn as a compact horizontal
+    // strip. Bar order (tmux, macros, cmds) is always preserved top-to-bottom.
+    final toolRows = <({List<_ToolBar> bars, _ToolBar? active})>[];
+    final leadingFolded = <_ToolBar>[];
+    for (final bar in bars) {
+      if (!bar.folded) {
+        toolRows.add((bars: [...leadingFolded, bar], active: bar));
+        leadingFolded.clear();
+      } else if (toolRows.isNotEmpty) {
+        toolRows.last.bars.add(bar);
+      } else {
+        leadingFolded.add(bar);
+      }
+    }
+    if (leadingFolded.isNotEmpty) {
+      toolRows.add((bars: leadingFolded, active: null));
+    }
+    return [
+      for (final row in toolRows) _buildToolRow(theme, row.bars, row.active),
+    ];
+  }
+
+  Widget _buildToolRow(ThemeData theme, List<_ToolBar> bars, _ToolBar? active) {
+    // Every bar folded: one compact horizontal strip of mini-buttons, no content.
+    if (active == null) {
+      return Material(
+        color: theme.colorScheme.surfaceContainerLow,
+        child: SizedBox(
+          height: 40,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              children: [
+                for (final bar in bars) ...[
+                  _toolBarMiniLabel(theme, bar),
+                  const SizedBox(width: 6),
+                ],
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+    // One unfolded bar, plus any folded bars sharing its row: stack the labels
+    // vertically on the left as mini-buttons and show the active bar's scrollable
+    // content on the right. Row height is intrinsic, so it grows just enough to
+    // fit the stacked labels (a single label stays at the usual ~40px).
+    return Material(
+      color: active.background,
+      child: Row(
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(left: 4, right: 6),
+            child: IntrinsicWidth(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  for (final bar in bars) _toolBarMiniLabel(theme, bar),
+                ],
+              ),
+            ),
+          ),
+          Expanded(child: SizedBox(height: 40, child: active.buildContent())),
+        ],
+      ),
+    );
+  }
+
+  /// The tmux row, in its catalog order. The row renders these and voice
+  /// control names them, so both run the same action.
+  List<_TmuxButton> _tmuxButtons() => [
+    _TmuxButton(
+      'tmux_new',
+      'New',
+      'tmux new window',
+      () => _sendTmuxCommand('c'),
+    ),
+    _TmuxButton(
+      'tmux_next',
+      'Next',
+      'tmux next window',
+      () => _sendTmuxCommand('n'),
+    ),
+    _TmuxButton(
+      'tmux_prev',
+      'Prev',
+      'tmux previous window',
+      () => _sendTmuxCommand('p'),
+    ),
+    for (var window = 0; window <= 5; window++)
+      _TmuxButton(
+        'tmux_window_$window',
+        '$window',
+        'tmux window $window',
+        () => _sendTmuxCommand('$window'),
+      ),
+    _TmuxButton(
+      'tmux_prefix',
+      'Prefix',
+      'tmux send prefix',
+      () => _sendTmuxCommand('\x02'),
+    ),
+    _TmuxButton(
+      'tmux_list',
+      'List',
+      'tmux window list',
+      () => _sendTmuxCommand('w'),
+    ),
+    _tmuxScrollMode
+        ? _TmuxButton(
+            'tmux_scroll',
+            'Exit scroll',
+            'Exit tmux copy/scroll mode',
+            _exitTmuxScrollMode,
+          )
+        : _TmuxButton(
+            'tmux_scroll',
+            'Scroll',
+            'tmux copy/scroll mode',
+            _enterTmuxScrollMode,
+          ),
+    _TmuxButton('tmux_mouse', 'Mouse', 'tmux mouse on', _enableTmuxMouse),
+    _TmuxButton(
+      'tmux_split_vertical',
+      'Split |',
+      'tmux split pane side by side',
+      () => _sendTmuxCommand('%'),
+    ),
+    _TmuxButton(
+      'tmux_split_horizontal',
+      'Split -',
+      'tmux split pane top and bottom',
+      () => _sendTmuxCommand('"'),
+    ),
+    _TmuxButton(
+      'tmux_detach',
+      'Detach',
+      'tmux detach session',
+      () => _sendTmuxCommand('d'),
+    ),
+  ];
+
+  Widget _buildTmuxContent(ThemeData theme) {
+    final buttons = _tmuxButtons();
+    final items = <({_TmuxButton button, int index})>[
+      for (var i = 0; i < buttons.length; i++) (button: buttons[i], index: i),
+    ];
+    // An arrangement the user dragged into place wins; a button it does not
+    // name yet (added in a later version) follows in catalog order: New,
+    // Next, Prev, windows 0-5, then the other tmux commands.
+    int arranged(String id) {
+      final at = _tmuxOrder.indexOf(id);
+      return at < 0 ? _tmuxOrder.length : at;
+    }
+
+    items.sort((a, b) {
+      final placed = arranged(a.button.id).compareTo(arranged(b.button.id));
+      if (placed != 0) return placed;
+      return a.index.compareTo(b.index);
+    });
+    final shown = [for (final item in items) item.button.id];
+
+    // Hold a button to pick it up, then drag it to where it belongs; a flick
+    // sends it to the start or the end of the row.
+    return MacroReorderableList(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      itemCount: items.length,
+      itemKey: (index) => ValueKey('tmux:${items[index].button.id}'),
+      onReposition: (from, to) => _repositionTmuxButton(shown, from, to),
+      itemBuilder: (context, index) {
+        final button = items[index].button;
+        return _terminalKeyButton(
+          button.label,
+          _tmuxTap(button),
+          tooltip: button.tooltip,
+          reorderable: true,
+        );
+      },
+    );
+  }
+
+  // A compact "mini-button" for a tool bar's label. Rendered stacked vertically
+  // when folded bars share a row, and in a horizontal strip when every bar is
+  // folded. Tap toggles the bar's buttons enabled/disabled; long-press folds or
+  // unfolds the bar. The active (unfolded) bar's label is accented; folded ones
+  // are plain-outlined. Disabled bars keep the dim + strike-through treatment.
+  Widget _toolBarMiniLabel(ThemeData theme, _ToolBar bar) {
+    final active = !bar.folded;
+    final accent = theme.colorScheme.primary;
+    final textColor = bar.enabled
+        ? theme.colorScheme.onSurfaceVariant
+        : theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.4);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: InkWell(
+        onTap: bar.onToggle,
+        onLongPress: bar.onToggleFold,
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          height: 16,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: active ? accent.withValues(alpha: 0.10) : null,
+            border: Border.all(
+              color: active
+                  ? accent.withValues(alpha: 0.55)
+                  : theme.colorScheme.outlineVariant,
+            ),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Text(
+            bar.label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              fontSize: 10.5,
+              height: 1,
+              color: textColor,
+              fontWeight: bar.enabled ? FontWeight.w600 : FontWeight.normal,
+              decoration: bar.enabled ? null : TextDecoration.lineThrough,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCommandContent(ThemeData theme) {
+    return ListView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      children: [
+        for (final command in widget.quickCommands)
+          _terminalCommandButton(command),
+      ],
+    );
+  }
+
+  Widget _buildMacroContent(ThemeData theme) {
+    final macros = widget.quickMacros;
+    final onReorder = widget.onMacroReorder;
+    if (onReorder == null) {
+      return ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        children: [for (final macro in macros) _terminalMacroButton(macro)],
+      );
+    }
+    // Hold a macro to pick it up: a slow drag slides it one slot at a time, a
+    // fast flick sends it to the start or the end of the bar.
+    return MacroReorderableList(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      itemCount: macros.length,
+      itemKey: (index) => ValueKey(macros[index].id),
+      onReposition: onReorder,
+      itemBuilder: (context, index) =>
+          _terminalMacroButton(macros[index], reorderable: true),
+    );
+  }
+
+  Widget _terminalMacroButton(TerminalMacro macro, {bool reorderable = false}) {
+    final enabled = _connected && !_inputLocked && _macroBarEnabled;
+    final button = SizedBox(
+      height: 32,
+      child: OutlinedButton.icon(
+        style: OutlinedButton.styleFrom(
+          visualDensity: VisualDensity.compact,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        icon: _inputLocked
+            ? const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.play_arrow, size: 16),
+        onPressed: enabled ? _macroTap(macro) : null,
+        label: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 160),
+          child: Text(macro.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+        ),
+      ),
+    );
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      // The tooltip's own long press would beat the hold-to-reposition drag to
+      // the gesture arena, so a reorderable bar leans on the button label —
+      // which already carries the macro name — instead.
+      child: reorderable ? button : Tooltip(message: macro.name, child: button),
+    );
+  }
+
+  Widget _terminalCommandButton(String command) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: Tooltip(
+        message: command,
+        child: SizedBox(
+          height: 32,
+          child: OutlinedButton.icon(
+            style: OutlinedButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            icon: _inputLocked
+                ? _macroBusySpinner(size: 16)
+                : const Icon(Icons.keyboard_return, size: 16),
+            onPressed: _commandBarEnabled && !_inputLocked
+                ? _commandTap(command)
+                : null,
+            label: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 180),
+              child: Text(
+                command,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontFamily: 'monospace'),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _terminalKeyButton(
+    String label,
+    VoidCallback onPressed, {
+    String? tooltip,
+    bool enabledWhenDisconnected = false,
+    bool reorderable = false,
+  }) {
+    final enabled =
+        (_connected || enabledWhenDisconnected) &&
+        _tmuxBarEnabled &&
+        !_inputLocked;
+    final button = SizedBox(
+      height: 32,
+      child: OutlinedButton(
+        style: OutlinedButton.styleFrom(
+          visualDensity: VisualDensity.compact,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        onPressed: enabled ? onPressed : null,
+        child: _inputLocked
+            ? Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _macroBusySpinner(),
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              )
+            : Text(label),
+      ),
+    );
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: tooltip == null
+          ? button
+          : Tooltip(
+              message: tooltip,
+              // A tooltip's own long press would win the gesture arena from
+              // the hold-to-reposition drag; hovering still shows it.
+              triggerMode: reorderable ? TooltipTriggerMode.manual : null,
+              child: button,
+            ),
+    );
+  }
+
+  Widget _buildComposer() {
+    final theme = Theme.of(context);
+    return Material(
+      elevation: 3,
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: ValueListenableBuilder<TextEditingValue>(
+                      valueListenable: _composerController,
+                      builder: (context, value, _) => TextField(
+                        controller: _composerController,
+                        focusNode: _composerFocusNode,
+                        decoration: InputDecoration(
+                          hintText: 'Type command',
+                          border: const OutlineInputBorder(),
+                          isDense: true,
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                          // Wipes the box in one tap, which matters most with
+                          // the phone keyboard off: there is no backspace then.
+                          suffixIcon: value.text.isEmpty
+                              ? null
+                              : IconButton(
+                                  tooltip: 'Clear text',
+                                  icon: const Icon(Icons.cancel),
+                                  onPressed: _composerController.clear,
+                                ),
+                        ),
+                        maxLines: 1,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        smartDashesType: SmartDashesType.disabled,
+                        smartQuotesType: SmartQuotesType.disabled,
+                        textCapitalization: TextCapitalization.none,
+                        textInputAction: TextInputAction.send,
+                        readOnly: _nativeKeyboardLocked,
+                        showCursor: !_nativeKeyboardLocked,
+                        keyboardType: _nativeKeyboardLocked
+                            ? TextInputType.none
+                            : TextInputType.text,
+                        onTap: _nativeKeyboardLocked
+                            ? () {
+                                _composerFocusNode.unfocus();
+                                FocusScope.of(
+                                  context,
+                                ).requestFocus(_terminalFocusNode);
+                                unawaited(
+                                  SystemChannels.textInput.invokeMethod<void>(
+                                    'TextInput.hide',
+                                  ),
+                                );
+                              }
+                            : null,
+                        onSubmitted: (_) => _submitComposer(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  IconButton.filled(
+                    icon: Icon(_recording ? Icons.stop : Icons.mic),
+                    tooltip: _recording ? 'Stop recording' : 'Voice input',
+                    style: _recording
+                        ? IconButton.styleFrom(
+                            backgroundColor: theme.colorScheme.errorContainer,
+                            foregroundColor: theme.colorScheme.onErrorContainer,
+                          )
+                        : null,
+                    onPressed: _transcribing || _inputLocked
+                        ? null
+                        : (_recording
+                              ? _finishVoiceRecording
+                              : _startVoiceRecording),
+                  ),
+                  const SizedBox(width: 2),
+                  IconButton.filled(
+                    icon: _transcribing
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.send),
+                    tooltip: 'Submit to SSH',
+                    onPressed: _canSubmitComposer ? _submitComposer : null,
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _field(
+    TextEditingController controller,
+    String label, {
+    TextInputType? keyboardType,
+    bool enabled = true,
+  }) {
+    return TextField(
+      controller: controller,
+      enabled: enabled && !_busy && !_profileBusy && !_connected,
+      decoration: InputDecoration(
+        labelText: label,
+        border: const OutlineInputBorder(),
+        isDense: true,
+      ),
+      keyboardType: keyboardType,
+      onChanged: (_) => _saveProfile(),
+    );
+  }
+}

@@ -1,0 +1,3131 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:dio/dio.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:open_filex/open_filex.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'backup_service.dart';
+import 'terminal_profiles.dart';
+import 'computer_profiles_panel.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'backup_tab.dart';
+import 'connect_tab.dart';
+import 'device_macro_evidence_outbox.dart';
+import 'device_macro_local_http.dart';
+import 'device_macro_runner.dart';
+import 'files_tab.dart';
+import 'macro_editor_screen.dart';
+import 'macro_reorder.dart';
+import 'macro_sync_service.dart';
+import 'openai_key_dialog.dart';
+import 'projects_tab.dart';
+import 'ssh_terminal_tab.dart';
+import 'ssh_terminal_sessions.dart';
+import 'terminal_macro.dart';
+import 'zero_tier_recovery.dart';
+import 'voice_input_service.dart';
+
+class BuildListScreen extends StatefulWidget {
+  const BuildListScreen({super.key});
+
+  @override
+  State<BuildListScreen> createState() => _BuildListScreenState();
+}
+
+class _BuildListScreenState extends State<BuildListScreen>
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
+  static const String _defaultServerUrl = 'http://127.0.0.1:8082';
+  static const double _appToolbarHeight = 36;
+  static const double _tabStripHeight = 38;
+  static const int _terminalTabIndex = 3;
+  static const String _lastUsedBuildAppIdKey = 'last_used_build_app_id';
+  static const String _lastUsedBuildPathKey = 'last_used_build_path';
+  static const String _terminalFullscreenKey = 'terminal_fullscreen';
+  static const MethodChannel _controlAgentChannel = MethodChannel(
+    'io.github.chasekolozsy.devota/control_agent',
+  );
+  static const int _macrosTabIndex = 5;
+  static const int _qaReplaysTabIndex = 6;
+  late final TabController _tabController;
+  List<String> _servers = [];
+  String _activeServer = _defaultServerUrl;
+  final _dio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 10),
+      receiveTimeout: const Duration(minutes: 5),
+    ),
+  );
+  late final DeviceMacroEvidenceOutbox _macroEvidenceOutbox;
+  List<Map<String, dynamic>> _builds = [];
+  bool _loading = false;
+  String? _error;
+  final Map<String, double> _downloadProgress = {};
+  final Map<String, bool> _downloading = {};
+  final Map<String, String> _downloadStatus = {};
+  final Map<String, Stopwatch> _downloadTimers = {};
+  Set<String> _installedPackages = {};
+  final _noteController = TextEditingController();
+  late final _voice = VoiceInputService(_dio);
+  List<String> _issues = [];
+  bool _isRecording = false;
+  bool _isTranscribing = false;
+  // Cached APKs that have been downloaded but not yet deleted.
+  // Keyed by sanitized build path so common names like app-debug.apk do not
+  // collide across apps.
+  Set<String> _cachedApks = {};
+  Directory? _apkCacheDir;
+
+  // Copy-paste command snippets shown on the Commands tab.
+  List<String> _commands = [];
+  Map<String, int> _commandUseCounts = {};
+  List<TerminalMacro> _macros = [];
+  Map<String, int> _macroUseCounts = {};
+  bool _repositioningMacro = false;
+  final _macroController = TerminalMacroController();
+  bool _deviceMacroRunning = false;
+  bool _deviceMacroStopRequested = false;
+  String? _deviceMacroName;
+  int _deviceMacroStepIndex = 0;
+  int _deviceMacroStepCount = 0;
+  String? _lastDeviceMacroRunId;
+  final _commandController = TextEditingController();
+  final _agentUrlController = TextEditingController();
+  final _agentTokenController = TextEditingController();
+  final _githubRepoController = TextEditingController();
+  final _githubWorkflowController = TextEditingController();
+  final _githubRefController = TextEditingController();
+  final _githubArtifactController = TextEditingController();
+  bool _agentWholeDevice = false;
+  TerminalProfiles? _computerProfiles;
+  Future<void>? _connectionsLoad;
+  bool _computerBusy = false;
+  final _profileStorage = const FlutterSecureStorage();
+  bool _agentBusy = false;
+  Map<String, dynamic>? _agentStatus;
+  bool _githubBusy = false;
+  String? _githubStatus;
+  List<Map<String, dynamic>> _githubRuns = [];
+  String? _lastUsedBuildAppId;
+  String? _lastUsedBuildPath;
+  bool _terminalFullscreen = false;
+  Timer? _backupDebounce;
+  String? _serverRestoreAttemptedFor;
+
+  @override
+  void initState() {
+    super.initState();
+    _macroEvidenceOutbox = DeviceMacroEvidenceOutbox(
+      rootDirectory: _getMacroEvidenceOutboxDir,
+      sender: (url, payload) async {
+        await _dio.post(
+          url,
+          data: payload,
+          options: Options(
+            headers: const {'Content-Type': 'application/json'},
+            sendTimeout: const Duration(minutes: 2),
+            receiveTimeout: const Duration(minutes: 2),
+          ),
+        );
+      },
+    );
+    WidgetsBinding.instance.addObserver(this);
+    _tabController = TabController(length: 10, vsync: this);
+    _tabController.addListener(_onTabControllerChanged);
+    _macroController.addListener(_onMacroControllerChanged);
+    _loadBuildUsePreferences();
+    _loadTerminalFullscreenPreference();
+    _loadServers();
+    _loadIssues();
+    _loadCommands();
+    _loadMacros();
+    _loadAgentSettings();
+    _loadGithubSettings();
+    _refreshCachedApks();
+    unawaited(_macroEvidenceOutbox.flush());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _tabController.removeListener(_onTabControllerChanged);
+    _macroController.removeListener(_onMacroControllerChanged);
+    _macroController.dispose();
+    _tabController.dispose();
+    _noteController.dispose();
+    _commandController.dispose();
+    _agentUrlController.dispose();
+    _agentTokenController.dispose();
+    _githubRepoController.dispose();
+    _githubWorkflowController.dispose();
+    _githubRefController.dispose();
+    _githubArtifactController.dispose();
+    _backupDebounce?.cancel();
+    _voice.dispose();
+    _dio.close();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // When the user returns from the system installer (success OR cancel),
+    // the downloaded APK is intentionally kept on disk so they can retry the
+    // install without re-downloading. Deletion is now manual via the trash icon.
+    if (state == AppLifecycleState.resumed) {
+      _refreshCachedApks();
+      _refreshInstalledPackages();
+      _syncAllProfileMacros();
+      unawaited(_macroEvidenceOutbox.flush());
+    }
+  }
+
+  Future<Directory> _getMacroEvidenceOutboxDir() async {
+    final support = await getApplicationSupportDirectory();
+    return Directory('${support.path}/device_macro_evidence_outbox');
+  }
+
+  void _onMacroControllerChanged() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  void _onTabControllerChanged() {
+    if ((_tabController.index == _macrosTabIndex ||
+            _tabController.index == _qaReplaysTabIndex) &&
+        !_tabController.indexIsChanging) {
+      unawaited(_syncMacrosFromServerSilently());
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _loadTerminalFullscreenPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    final fullscreen = prefs.getBool(_terminalFullscreenKey) ?? false;
+    if (mounted) setState(() => _terminalFullscreen = fullscreen);
+  }
+
+  Future<void> _saveTerminalFullscreenPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_terminalFullscreenKey, _terminalFullscreen);
+  }
+
+  void _setTerminalFullscreen(bool fullscreen) {
+    if (_terminalFullscreen == fullscreen) return;
+    setState(() => _terminalFullscreen = fullscreen);
+    unawaited(_saveTerminalFullscreenPreference());
+  }
+
+  Future<Directory> _getApkCacheDir() async {
+    if (_apkCacheDir != null) return _apkCacheDir!;
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory('${docs.path}/apk_cache');
+    if (!dir.existsSync()) await dir.create(recursive: true);
+    _apkCacheDir = dir;
+    return dir;
+  }
+
+  Future<void> _refreshCachedApks() async {
+    final dir = await _getApkCacheDir();
+    final files = dir.listSync().whereType<File>().where(
+      (f) => f.path.endsWith('.apk'),
+    );
+    final names = files.map((f) {
+      final segs = f.path.split(RegExp(r'[\\/]'));
+      return segs.last;
+    }).toSet();
+    if (!mounted) return;
+    setState(() => _cachedApks = names);
+  }
+
+  String _cacheFileName(Map<String, dynamic> build) {
+    final path = (build['path'] as String?) ?? (build['filename'] as String);
+    final safe = path.replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '_');
+    return safe.endsWith('.apk') ? safe : '$safe.apk';
+  }
+
+  String _buildPath(Map<String, dynamic> build) {
+    return (build['path'] ?? build['filename'] ?? '').toString();
+  }
+
+  String _buildPackageName(Map<String, dynamic> build) {
+    return (build['packageName'] ?? '').toString().trim();
+  }
+
+  Future<void> _loadBuildUsePreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _lastUsedBuildAppId = prefs.getString(_lastUsedBuildAppIdKey);
+      _lastUsedBuildPath = prefs.getString(_lastUsedBuildPathKey);
+    });
+  }
+
+  Future<void> _recordBuildUse(Map<String, dynamic> build) async {
+    final appId = _buildAppId(build);
+    final path = _buildPath(build);
+    setState(() {
+      _lastUsedBuildAppId = appId;
+      _lastUsedBuildPath = path.isEmpty ? null : path;
+    });
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_lastUsedBuildAppIdKey, appId);
+    if (path.isEmpty) {
+      await prefs.remove(_lastUsedBuildPathKey);
+    } else {
+      await prefs.setString(_lastUsedBuildPathKey, path);
+    }
+    _scheduleServerBackup();
+  }
+
+  Future<void> _refreshInstalledPackages([
+    Iterable<Map<String, dynamic>>? builds,
+  ]) async {
+    final source = builds ?? _builds;
+    final packages = source
+        .map(_buildPackageName)
+        .where((packageName) => packageName.isNotEmpty)
+        .toSet();
+    if (packages.isEmpty) {
+      if (mounted) setState(() => _installedPackages = {});
+      return;
+    }
+    final installed = <String>{};
+    for (final packageName in packages) {
+      try {
+        final ok = await _controlAgentChannel.invokeMethod<bool>(
+          'isPackageInstalled',
+          {'packageName': packageName},
+        );
+        if (ok == true) installed.add(packageName);
+      } catch (_) {}
+    }
+    if (mounted) setState(() => _installedPackages = installed);
+  }
+
+  Future<void> _openInstalledBuildApp(Map<String, dynamic> build) async {
+    final packageName = _buildPackageName(build);
+    if (packageName.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Build does not declare a package name')),
+      );
+      return;
+    }
+    try {
+      final opened = await _controlAgentChannel.invokeMethod<bool>(
+        'openPackage',
+        {'packageName': packageName},
+      );
+      if (opened != true && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('No launcher found for $packageName')),
+        );
+      } else if (opened == true) {
+        await _recordBuildUse(build);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Open failed: ${_briefErrorMessage(e)}')),
+      );
+    }
+  }
+
+  Future<void> _installCachedApk(Map<String, dynamic> build) async {
+    final filename = _cacheFileName(build);
+    final dir = await _getApkCacheDir();
+    final apkPath = '${dir.path}/$filename';
+    if (!File(apkPath).existsSync()) {
+      // Cache disappeared underneath us — fall back to a fresh download.
+      await _refreshCachedApks();
+      await _downloadAndInstall(build);
+      return;
+    }
+    final result = await OpenFilex.open(
+      apkPath,
+      type: 'application/vnd.android.package-archive',
+    );
+    if (result.type != ResultType.done && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not open installer: ${result.message}')),
+      );
+    } else if (result.type == ResultType.done) {
+      await _recordBuildUse(build);
+    }
+    await Future.delayed(const Duration(milliseconds: 500));
+    await _refreshInstalledPackages();
+  }
+
+  Future<void> _deleteCachedApk(Map<String, dynamic> build) async {
+    final filename = _cacheFileName(build);
+    final dir = await _getApkCacheDir();
+    final f = File('${dir.path}/$filename');
+    try {
+      if (f.existsSync()) await f.delete();
+    } catch (_) {}
+    await _refreshCachedApks();
+    if (mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Deleted $filename')));
+    }
+  }
+
+  Future<void> _loadCommands() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getStringList('commands');
+    final countsJson = prefs.getString('command_usage_counts_json');
+    if (countsJson != null && countsJson.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(countsJson);
+        if (decoded is Map) {
+          _commandUseCounts = decoded.map(
+            (key, value) => MapEntry(
+              key.toString(),
+              value is int ? value : int.tryParse(value.toString()) ?? 0,
+            ),
+          );
+        }
+      } catch (_) {
+        _commandUseCounts = {};
+      }
+    }
+    if (saved != null && mounted) {
+      setState(() => _commands = saved);
+    }
+  }
+
+  Future<void> _saveCommands() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('commands', _commands);
+    await prefs.setString(
+      'command_usage_counts_json',
+      jsonEncode(_commandUseCounts),
+    );
+    _scheduleServerBackup();
+  }
+
+  List<String> get _rankedCommands {
+    final indexed = _commands.asMap().entries.toList();
+    indexed.sort((a, b) {
+      final usage = (_commandUseCounts[b.value] ?? 0).compareTo(
+        _commandUseCounts[a.value] ?? 0,
+      );
+      if (usage != 0) return usage;
+      return a.key.compareTo(b.key);
+    });
+    return indexed.map((entry) => entry.value).toList();
+  }
+
+  List<String> get _quickCommands => _rankedCommands.take(12).toList();
+
+  void _addCommand() {
+    final text = _commandController.text.trim();
+    if (text.isEmpty) return;
+    setState(() => _commands.add(text));
+    _commandController.clear();
+    _saveCommands();
+  }
+
+  void _removeCommand(int index) {
+    final command = _commands[index];
+    setState(() {
+      _commands.removeAt(index);
+      if (!_commands.contains(command)) _commandUseCounts.remove(command);
+    });
+    _saveCommands();
+  }
+
+  void _removeCommandValue(String command) {
+    final index = _commands.indexOf(command);
+    if (index >= 0) _removeCommand(index);
+  }
+
+  void _recordCommandUse(String cmd) {
+    if (cmd.trim().isEmpty) return;
+    setState(() {
+      _commandUseCounts[cmd] = (_commandUseCounts[cmd] ?? 0) + 1;
+    });
+    _saveCommands();
+  }
+
+  void _copyCommand(String cmd) {
+    _recordCommandUse(cmd);
+    Clipboard.setData(ClipboardData(text: cmd));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Copied'),
+        duration: Duration(milliseconds: 900),
+      ),
+    );
+  }
+
+  void _pushCommandToServerClipboard(String cmd) {
+    _recordCommandUse(cmd);
+    _pushToServerClipboard(cmd, label: 'clipboard');
+  }
+
+  /// The macro list and usage counts of one computer profile. Each computer
+  /// runs its own DevOTA server with its own macro store, and the same macro id
+  /// can hold different content on each, so a retained terminal must keep its own computer's
+  /// list while another computer is selected.
+  static const _macrosByProfileKey = 'macros_by_profile_json';
+  static const _macrosProfileIdKey = 'macros_profile_id';
+
+  static Map<String, int> _decodeUseCounts(Object? decoded) {
+    if (decoded is! Map) return {};
+    return decoded.map(
+      (key, value) => MapEntry(
+        key.toString(),
+        value is int ? value : int.tryParse(value.toString()) ?? 0,
+      ),
+    );
+  }
+
+  static List<TerminalMacro> _decodeMacros(Object? decoded) {
+    if (decoded is! List) return [];
+    return decoded
+        .whereType<Map>()
+        .map((item) => TerminalMacro.fromJson(Map<String, dynamic>.from(item)))
+        .where((macro) => macro.name.trim().isNotEmpty)
+        .toList();
+  }
+
+  Future<void> _loadMacros() async {
+    final prefs = await SharedPreferences.getInstance();
+    final byProfile = <String, MacroSyncSnapshot>{};
+    try {
+      final raw = prefs.getString(_macrosByProfileKey);
+      final decoded = raw == null || raw.isEmpty ? null : jsonDecode(raw);
+      if (decoded is Map) {
+        for (final entry in decoded.entries) {
+          if (entry.value is! Map) continue;
+          final row = Map<String, dynamic>.from(entry.value as Map);
+          byProfile[entry.key.toString()] = MacroSyncSnapshot(
+            macros: _decodeMacros(row['macros']),
+            usageCounts: _decodeUseCounts(row['usageCounts']),
+          );
+        }
+      }
+    } catch (_) {
+      byProfile.clear();
+    }
+    // The legacy keys always hold the selected computer's list as last saved
+    // (and are what a backup restores), so they win for their owner.
+    var counts = <String, int>{};
+    var macros = <TerminalMacro>[];
+    try {
+      final countsJson = prefs.getString('macro_usage_counts_json');
+      if (countsJson != null && countsJson.isNotEmpty) {
+        counts = _decodeUseCounts(jsonDecode(countsJson));
+      }
+    } catch (_) {
+      counts = {};
+    }
+    try {
+      final macrosJson = prefs.getString('macros_json');
+      if (macrosJson != null && macrosJson.isNotEmpty) {
+        macros = _decodeMacros(jsonDecode(macrosJson));
+      }
+    } catch (_) {
+      macros = [];
+    }
+    final savedOwner = prefs.getString(_macrosProfileIdKey) ?? '';
+    byProfile[savedOwner] = MacroSyncSnapshot(
+      macros: macros,
+      usageCounts: counts,
+    );
+    if (!mounted) return;
+    // Show the saved list at once; which computer owns it is settled below.
+    setState(() {
+      _macrosByProfile
+        ..clear()
+        ..addAll(byProfile);
+      _showProfileMacros(savedOwner);
+    });
+    try {
+      await _loadServers();
+    } catch (_) {
+      // Without computer profiles the saved list stays the only one.
+    }
+    final profiles = _computerProfiles;
+    if (!mounted || profiles == null) return;
+    final known = profiles.profiles.map((p) => p.id).toSet();
+    setState(() {
+      _stashProfileMacros();
+      if (!known.contains(_macrosProfileId)) {
+        // Saved before lists were kept per computer: the selected one's.
+        _macrosByProfile[profiles.selectedId] = _macrosByProfile.remove(
+          _macrosProfileId,
+        )!;
+      }
+      _macrosByProfile.removeWhere((id, _) => !known.contains(id));
+      _showProfileMacros(profiles.selectedId);
+    });
+    unawaited(_syncMacrosFromServerSilently());
+  }
+
+  /// Every profile's macros, the selected one's live edits included.
+  final _macrosByProfile = <String, MacroSyncSnapshot>{};
+
+  /// The profile [_macros] and [_macroUseCounts] belong to.
+  String _macrosProfileId = '';
+
+  void _stashProfileMacros() {
+    _macrosByProfile[_macrosProfileId] = MacroSyncSnapshot(
+      macros: List.of(_macros),
+      usageCounts: Map.of(_macroUseCounts),
+    );
+  }
+
+  /// Makes [profileId]'s list the editable one. Call inside setState.
+  void _showProfileMacros(String profileId) {
+    final saved = _macrosByProfile[profileId];
+    _macrosProfileId = profileId;
+    _macros = saved == null ? [] : List.of(saved.macros);
+    _macroUseCounts = saved == null ? {} : Map.of(saved.usageCounts);
+  }
+
+  /// The macros a profile's retained terminal runs and auto-runs.
+  List<TerminalMacro> _macrosForProfile(String profileId) =>
+      profileId == _macrosProfileId || _computerProfiles == null
+      ? _macros
+      : _macrosByProfile[profileId]?.macros ?? const [];
+
+  String _serverUrlForProfile(String profileId) {
+    final profiles = _computerProfiles;
+    if (profiles == null || profileId == profiles.selectedId) return _baseUrl;
+    for (final profile in profiles.profiles) {
+      if (profile.id == profileId) {
+        return profile.serverUrl.trim().replaceAll(RegExp(r'/+$'), '');
+      }
+    }
+    return '';
+  }
+
+  Future<void> _saveMacros({bool syncServer = true}) async {
+    final prefs = await SharedPreferences.getInstance();
+    _stashProfileMacros();
+    await prefs.setString(
+      'macros_json',
+      jsonEncode(_macros.map((macro) => macro.toJson()).toList()),
+    );
+    await prefs.setString(
+      'macro_usage_counts_json',
+      jsonEncode(_macroUseCounts),
+    );
+    await prefs.setString(_macrosProfileIdKey, _macrosProfileId);
+    await _saveMacrosByProfile(prefs);
+    _scheduleServerBackup();
+    if (syncServer) unawaited(_pushMacrosToServerSilently());
+  }
+
+  Future<void> _saveMacrosByProfile([SharedPreferences? prefs]) async {
+    prefs ??= await SharedPreferences.getInstance();
+    await prefs.setString(
+      _macrosByProfileKey,
+      jsonEncode({
+        for (final entry in _macrosByProfile.entries)
+          entry.key: entry.value.toJson(),
+      }),
+    );
+  }
+
+  Future<void> _pushMacrosToServerSilently() async {
+    try {
+      await MacroSyncService.sync(
+        _dio,
+        _serverUrlForProfile(_macrosProfileId),
+        macros: _macros,
+        usageCounts: _macroUseCounts,
+      );
+    } catch (_) {
+      // Macro sync is opportunistic; local editing should keep working offline.
+    }
+  }
+
+  final _macrosSyncFutures = <String, Future<void>>{};
+
+  /// Refreshes [profileId]'s macros (the selected computer's by default) from
+  /// that computer's own DevOTA server.
+  Future<void> _syncMacrosFromServerSilently([String? profileId]) async {
+    final id = profileId ?? _macrosProfileId;
+    final inFlight = _macrosSyncFutures[id];
+    if (inFlight != null) return inFlight;
+    final future = _syncMacrosFromServerOnce(id);
+    _macrosSyncFutures[id] = future;
+    try {
+      await future;
+    } finally {
+      if (identical(_macrosSyncFutures[id], future)) {
+        _macrosSyncFutures.remove(id);
+      }
+    }
+  }
+
+  Future<void> _syncMacrosFromServerOnce(String profileId) async {
+    final server = _serverUrlForProfile(profileId);
+    if (server.isEmpty) return;
+    try {
+      final snapshot = await MacroSyncService.fetch(_dio, server);
+      if (snapshot == null) {
+        // Seed a server without a store from the list being edited only.
+        if (profileId == _macrosProfileId) {
+          await _pushMacrosToServerSilently();
+        }
+        return;
+      }
+      if (!mounted) return;
+      setState(() {
+        _macrosByProfile[profileId] = snapshot;
+        if (profileId == _macrosProfileId) _showProfileMacros(profileId);
+      });
+      if (profileId == _macrosProfileId) {
+        await _saveMacros(syncServer: false);
+      } else {
+        await _saveMacrosByProfile();
+      }
+    } catch (_) {
+      // A missing or unreachable build server must not block local macros.
+    }
+  }
+
+  /// Refreshes every computer whose terminal may be running in the background.
+  void _syncAllProfileMacros() {
+    final selected = _macrosProfileId;
+    unawaited(_syncMacrosFromServerSilently(selected));
+    for (final id in _macrosByProfile.keys.toList()) {
+      if (id != selected) unawaited(_syncMacrosFromServerSilently(id));
+    }
+  }
+
+  List<TerminalMacro> get _rankedMacros => rankTerminalMacros(_macros);
+
+  List<TerminalMacro> get _quickMacros =>
+      _rankedMacros
+          .where((macro) => !macro.isDeviceMacro)
+          .take(quickTerminalMacroCount)
+          .toList();
+
+  bool get _anyMacroRunning =>
+      _deviceMacroRunning || _macroController.isRunning;
+
+  MacroRunProgress? get _visibleMacroProgress {
+    if (_deviceMacroRunning) {
+      return MacroRunProgress(
+        macroName: _deviceMacroName ?? 'Device macro',
+        stepIndex: _deviceMacroStepIndex,
+        stepCount: _deviceMacroStepCount,
+        stopping: _deviceMacroStopRequested,
+      );
+    }
+    return _macroController.progress;
+  }
+
+  void _recordMacroUseFor(String profileId, TerminalMacro macro) {
+    if (profileId == _macrosProfileId) {
+      _recordMacroUse(macro);
+      return;
+    }
+    final saved = _macrosByProfile[profileId];
+    if (saved == null) return;
+    // Counted locally only: pushing a cached list back would overwrite edits
+    // made on that computer's server since it was last fetched.
+    final counts = Map.of(saved.usageCounts);
+    counts[macro.id] = (counts[macro.id] ?? 0) + 1;
+    _macrosByProfile[profileId] = MacroSyncSnapshot(
+      macros: saved.macros,
+      usageCounts: counts,
+    );
+    unawaited(_saveMacrosByProfile());
+  }
+
+  void _recordMacroUse(TerminalMacro macro) {
+    setState(() {
+      _macroUseCounts[macro.id] = (_macroUseCounts[macro.id] ?? 0) + 1;
+    });
+    unawaited(_saveMacros());
+  }
+
+  /// Drops a dragged macro at [targetRankedIndex] of the ranked order shared by
+  /// both macro tabs and the terminal macro bar.
+  void _moveMacroToRank(String macroId, int targetRankedIndex) {
+    final reordered = repositionTerminalMacro(
+      _macros,
+      macroId,
+      targetRankedIndex,
+    );
+    if (identical(reordered, _macros)) return;
+    setState(() => _macros = reordered);
+    unawaited(_saveMacros());
+  }
+
+  /// Repositions from the terminal's quick-macro strip. The strip shows only the
+  /// first few non-device macros, so a move there is translated into the ranked
+  /// position of the quick macro it was dropped onto — the macro lands exactly
+  /// where the user saw it land, and hidden macros between them keep their
+  /// relative order.
+  void _repositionQuickMacro(int fromIndex, int toIndex) {
+    final quick = _quickMacros;
+    if (fromIndex < 0 || fromIndex >= quick.length) return;
+    final target = toIndex.clamp(0, quick.length - 1);
+    if (fromIndex == target) return;
+    final ranked = _rankedMacros;
+    final targetRank = ranked.indexWhere(
+      (macro) => macro.id == quick[target].id,
+    );
+    if (targetRank < 0) return;
+    _moveMacroToRank(quick[fromIndex].id, targetRank);
+  }
+
+  Future<void> _addMacro({bool qaReplay = false}) async {
+    final macro = TerminalMacro(
+      id: newTerminalMacroId('macro'),
+      name: qaReplay ? 'New QA replay' : 'New macro',
+      steps: [
+        newTerminalMacroStep(
+          qaReplay ? TerminalMacroStepType.device : TerminalMacroStepType.shell,
+        ),
+      ],
+    );
+    final edited = await _showMacroEditor(macro, isNew: true);
+    if (edited == null) return;
+    setState(() => _macros.add(edited));
+    unawaited(_saveMacros());
+  }
+
+  Future<void> _editMacro(TerminalMacro macro) async {
+    final edited = await _showMacroEditor(macro);
+    if (edited == null) return;
+    final index = _macros.indexWhere((item) => item.id == macro.id);
+    if (index < 0) return;
+    setState(() => _macros[index] = edited);
+    unawaited(_saveMacros());
+  }
+
+  void _duplicateMacro(TerminalMacro macro) {
+    final copy = macro.copyWith(
+      id: newTerminalMacroId('macro'),
+      name: '${macro.name} copy',
+      steps: macro.steps
+          .map((step) => step.copyWith(id: newTerminalMacroId('step')))
+          .toList(),
+    );
+    setState(() => _macros.add(copy));
+    unawaited(_saveMacros());
+  }
+
+  void _removeMacro(TerminalMacro macro) {
+    setState(() {
+      _macros.removeWhere((item) => item.id == macro.id);
+      _macroUseCounts.remove(macro.id);
+    });
+    unawaited(_saveMacros());
+  }
+
+  Future<void> _runMacroFromMacrosTab(TerminalMacro macro) async {
+    if (_anyMacroRunning) return;
+    if (macro.name != zeroTierRecoveryMacroName) {
+      await _syncMacrosFromServerSilently();
+    }
+    if (!mounted || _anyMacroRunning) return;
+    TerminalMacro? currentMacro;
+    for (final item in _macros) {
+      if (item.id == macro.id) {
+        currentMacro = item;
+        break;
+      }
+    }
+    if (currentMacro == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Macro no longer exists on the server')),
+      );
+      return;
+    }
+    if (currentMacro.isDeviceMacro) {
+      await _runDeviceMacro(repairZeroTierRecoveryMacro(currentMacro));
+      return;
+    }
+    _tabController.animateTo(3);
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    try {
+      await _macroController.run(currentMacro);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Macro failed: ${_briefErrorMessage(e)}')),
+      );
+    }
+  }
+
+  String _newDeviceMacroRunId(TerminalMacro macro) {
+    final timestamp = DateTime.now().toUtc().toIso8601String().replaceAll(
+      RegExp(r'[^0-9]'),
+      '',
+    );
+    final safeMacro = macro.id.replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '-');
+    final end = safeMacro.length > 80 ? 80 : safeMacro.length;
+    return 'run-$timestamp-${safeMacro.substring(0, end)}';
+  }
+
+  Future<void> _queueDeviceMacroEvidence(
+    String runId,
+    TerminalMacro macro,
+    DateTime runStartedAt,
+    DeviceMacroEvidence evidence,
+  ) async {
+    await _macroEvidenceOutbox.enqueueStep(
+      runId: runId,
+      baseUrl: _baseUrl,
+      payload: {
+        'macroId': macro.id,
+        'macroName': macro.name,
+        'runStartedAt': runStartedAt.toUtc().toIso8601String(),
+        ...evidence.toJson(),
+      },
+    );
+    // Delivery remains best-effort and asynchronous so a weak relay cannot
+    // alter local execution or screenshot cadence, but completed steps should
+    // become observable while a long-running macro is still in progress.
+    unawaited(_macroEvidenceOutbox.flush());
+  }
+
+  Future<void> _queueDeviceMacroRunCompletion(
+    String runId,
+    TerminalMacro macro,
+    DateTime startedAt, {
+    required String status,
+    Object? error,
+  }) async {
+    await _macroEvidenceOutbox.enqueueCompletion(
+      runId: runId,
+      baseUrl: _baseUrl,
+      payload: {
+        'macroId': macro.id,
+        'macroName': macro.name,
+        'startedAt': startedAt.toUtc().toIso8601String(),
+        'completedAt': DateTime.now().toUtc().toIso8601String(),
+        'status': status,
+        if (error != null) 'error': error.toString(),
+      },
+    );
+    unawaited(_macroEvidenceOutbox.flush());
+  }
+
+  Future<Map<String, dynamic>> _installBuildFromMacro(
+    Map<String, dynamic> args,
+  ) async {
+    final appId = args['appId']?.toString().trim();
+    final requestedPath = args['path']?.toString().trim();
+    final candidates = _builds.where((build) {
+      if (requestedPath?.isNotEmpty == true &&
+          _buildPath(build) != requestedPath) {
+        return false;
+      }
+      if (appId?.isNotEmpty == true && _buildAppId(build) != appId) {
+        return false;
+      }
+      return true;
+    }).toList();
+    if (candidates.isEmpty) {
+      throw StateError(
+        'no DevOTA build matched appId=${appId ?? '*'} path=${requestedPath ?? '*'}',
+      );
+    }
+    final build = candidates.first;
+    return _downloadAndInstall(build, throwOnError: true);
+  }
+
+  Future<bool> _runDeviceMacro(TerminalMacro macro) async {
+    if (macro.name == zeroTierRecoveryMacroName) {
+      final status = await _controlAgentChannel
+          .invokeMapMethod<String, dynamic>('getAgentStatus');
+      final problem = zeroTierRecoveryReadiness(status ?? {});
+      if (problem != null) {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(problem)));
+        }
+        return false;
+      }
+      macro = repairZeroTierRecoveryMacro(macro);
+    }
+    final runId = _newDeviceMacroRunId(macro);
+    final startedAt = DateTime.now();
+    Object? failure;
+    var status = 'passed';
+    setState(() {
+      _deviceMacroRunning = true;
+      _deviceMacroStopRequested = false;
+      _deviceMacroName = macro.name;
+      _deviceMacroStepIndex = 0;
+      _deviceMacroStepCount = macro.steps.length;
+      _lastDeviceMacroRunId = runId;
+    });
+    try {
+      final runner = DeviceMacroRunner(
+        channel: _controlAgentChannel,
+        evidenceSink: (evidence) =>
+            _queueDeviceMacroEvidence(runId, macro, startedAt, evidence),
+        installBuild: _installBuildFromMacro,
+        localHttpAssert: (args, {onAttempt}) =>
+            runDeviceMacroLocalHttpAssert(_dio, args, onAttempt: onAttempt),
+        shouldStop: () => _deviceMacroStopRequested,
+        onProgress: (stepIndex, stepCount, _) {
+          if (!mounted) return;
+          setState(() {
+            _deviceMacroStepIndex = stepIndex;
+            _deviceMacroStepCount = stepCount;
+          });
+        },
+      );
+      await runner.run(macro);
+      if (_deviceMacroStopRequested) status = 'stopped';
+      _recordMacroUse(macro);
+    } catch (error) {
+      failure = error;
+      status = 'failed';
+    }
+    try {
+      await _queueDeviceMacroRunCompletion(
+        runId,
+        macro,
+        startedAt,
+        status: status,
+        error: failure,
+      );
+    } catch (error) {
+      failure ??= error;
+      status = 'failed';
+    }
+    final succeeded = failure == null && status == 'passed';
+    if (!mounted) return succeeded;
+    setState(() {
+      _deviceMacroRunning = false;
+      _deviceMacroStopRequested = false;
+      _deviceMacroName = null;
+      _deviceMacroStepIndex = 0;
+      _deviceMacroStepCount = 0;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          failure == null
+              ? 'Macro $status locally. Evidence queued: $runId'
+              : 'Macro failed locally: ${_briefErrorMessage(failure)} '
+                    '(evidence queued: $runId)',
+        ),
+      ),
+    );
+    return succeeded;
+  }
+
+  Future<bool> _runZeroTierRecoveryMacro() async {
+    if (_anyMacroRunning) return false;
+    // Recovery must work without the network it is repairing.
+    final status = await _controlAgentChannel.invokeMapMethod<String, dynamic>(
+      'getAgentStatus',
+    );
+    final problem = zeroTierRecoveryReadiness(status ?? {});
+    if (problem != null) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(problem)));
+      }
+      throw StateError(problem);
+    }
+    if (!mounted || _anyMacroRunning) return false;
+    TerminalMacro? recovery;
+    for (final macro in _macros) {
+      if (macro.name == zeroTierRecoveryMacroName && macro.isDeviceMacro) {
+        recovery = repairZeroTierRecoveryMacro(macro);
+        break;
+      }
+    }
+    if (recovery == null) {
+      throw StateError(
+        'ZeroTier recovery macro is unavailable. Sync Macros while online first.',
+      );
+    }
+    return _runDeviceMacro(recovery);
+  }
+
+  String _issuesAsText() {
+    return _issues
+        .asMap()
+        .entries
+        .map((e) => '${e.key + 1}. ${e.value}')
+        .join('\n');
+  }
+
+  Future<void> _loadIssues() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getStringList('issues');
+    if (saved != null && mounted) {
+      setState(() => _issues = saved);
+    }
+  }
+
+  Future<void> _saveIssues() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('issues', _issues);
+    _scheduleServerBackup();
+  }
+
+  void _addIssue() {
+    final text = _noteController.text.trim();
+    if (text.isEmpty) return;
+    setState(() => _issues.add(text));
+    _noteController.clear();
+    _saveIssues();
+  }
+
+  void _removeIssue(int index) {
+    setState(() => _issues.removeAt(index));
+    _saveIssues();
+  }
+
+  void _copyAllIssues() {
+    if (_issues.isEmpty) return;
+    Clipboard.setData(ClipboardData(text: _issuesAsText()));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('${_issues.length} issue(s) copied')),
+    );
+  }
+
+  void _clearAllIssues() {
+    setState(() => _issues.clear());
+    _saveIssues();
+  }
+
+  Future<String?> _promptOpenAiKey() async {
+    final initialValue = await _voice.loadApiKey() ?? '';
+    if (!mounted) return null;
+    final key = await OpenAiKeyDialog.show(context, initialValue: initialValue);
+    if (key != null && key.isNotEmpty) {
+      await _voice.saveApiKey(key);
+      _scheduleServerBackup();
+    }
+    return key;
+  }
+
+  Future<void> _toggleIssueRecording() async {
+    if (_isRecording) {
+      final path = await _voice.stopRecording();
+      if (!mounted) return;
+      setState(() {
+        _isRecording = false;
+        _isTranscribing = true;
+      });
+      try {
+        final key = await _voice.loadApiKey();
+        if (key == null || key.isEmpty) return;
+        final text = path == null ? '' : await _voice.transcribe(path, key);
+        if (text.isNotEmpty) {
+          final existing = _noteController.text;
+          _noteController.text = existing.isEmpty ? text : '$existing $text';
+          _noteController.selection = TextSelection.fromPosition(
+            TextPosition(offset: _noteController.text.length),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('Transcription failed: $e')));
+        }
+      } finally {
+        await VoiceInputService.deleteRecording(path);
+        if (mounted) setState(() => _isTranscribing = false);
+      }
+      return;
+    }
+
+    var key = await _voice.loadApiKey();
+    if (key == null || key.isEmpty) {
+      key = await _promptOpenAiKey();
+      if (key == null || key.isEmpty) return;
+    }
+    final ok = await _voice.requestMicrophone();
+    if (!ok) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Microphone permission required')),
+        );
+      }
+      return;
+    }
+    await _voice.startRecording('issue_voice_note.m4a');
+    if (mounted) setState(() => _isRecording = true);
+  }
+
+  Future<void> _loadAgentSettings() async {
+    await _loadServers();
+    await _applyAgentProfile();
+    await _refreshAgentStatus();
+  }
+
+  Future<void> _loadGithubSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    _githubRepoController.text =
+        prefs.getString('github_repo') ?? 'ChaseKolozsy/dev-ota';
+    _githubWorkflowController.text =
+        prefs.getString('github_workflow') ?? 'android.yml';
+    _githubRefController.text = prefs.getString('github_ref') ?? 'main';
+    var artifact = prefs.getString('github_artifact') ?? 'devota-android-apks';
+    // Migrate legacy debug-only artifact name to unified name that includes release.
+    if (artifact == 'devota-android-debug-apks') {
+      artifact = 'devota-android-apks';
+    }
+    _githubArtifactController.text = artifact;
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _saveGithubSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('github_repo', _githubRepoController.text.trim());
+    await prefs.setString(
+      'github_workflow',
+      _githubWorkflowController.text.trim(),
+    );
+    await prefs.setString('github_ref', _githubRefController.text.trim());
+    await prefs.setString(
+      'github_artifact',
+      _githubArtifactController.text.trim(),
+    );
+    _scheduleServerBackup();
+  }
+
+  Future<void> _runGithubWorkflow() async {
+    await _saveGithubSettings();
+    if (!mounted) return;
+    setState(() {
+      _githubBusy = true;
+      _githubStatus = 'Dispatching workflow...';
+    });
+    try {
+      final resp = await _dio.post(
+        '$_baseUrl/github/workflow/run',
+        data: {
+          'repo': _githubRepoController.text.trim(),
+          'workflow': _githubWorkflowController.text.trim(),
+          'ref': _githubRefController.text.trim(),
+        },
+        options: Options(sendTimeout: const Duration(seconds: 15)),
+      );
+      final data = Map<String, dynamic>.from(resp.data as Map);
+      final runs = data['runs'] is List ? data['runs'] as List : const [];
+      setState(() {
+        _githubRuns = runs
+            .whereType<Map>()
+            .map((item) => Map<String, dynamic>.from(item))
+            .toList();
+        _githubStatus = 'Workflow dispatched.';
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _githubStatus =
+              'Workflow dispatch failed: ${_briefErrorMessage(e)}',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _githubBusy = false);
+    }
+  }
+
+  Future<void> _refreshGithubRuns() async {
+    await _saveGithubSettings();
+    if (!mounted) return;
+    setState(() {
+      _githubBusy = true;
+      _githubStatus = 'Loading workflow runs...';
+    });
+    try {
+      final resp = await _dio.get(
+        '$_baseUrl/github/workflow/runs',
+        queryParameters: {
+          'repo': _githubRepoController.text.trim(),
+          'workflow': _githubWorkflowController.text.trim(),
+          'limit': '5',
+        },
+      );
+      final data = Map<String, dynamic>.from(resp.data as Map);
+      final runs = data['runs'] is List ? data['runs'] as List : const [];
+      setState(() {
+        _githubRuns = runs
+            .whereType<Map>()
+            .map((item) => Map<String, dynamic>.from(item))
+            .toList();
+        _githubStatus = 'Loaded ${_githubRuns.length} run(s).';
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () =>
+              _githubStatus = 'Workflow list failed: ${_briefErrorMessage(e)}',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _githubBusy = false);
+    }
+  }
+
+  Future<void> _downloadGithubArtifact({int? runId}) async {
+    await _saveGithubSettings();
+    if (!mounted) return;
+    setState(() {
+      _githubBusy = true;
+      _githubStatus = 'Downloading artifact...';
+    });
+    try {
+      final payload = <String, Object>{
+        'repo': _githubRepoController.text.trim(),
+        'workflow': _githubWorkflowController.text.trim(),
+        'artifactName': _githubArtifactController.text.trim(),
+      };
+      if (runId != null) payload['runId'] = runId;
+      final resp = await _dio.post(
+        '$_baseUrl/github/workflow/download',
+        data: payload,
+        options: Options(receiveTimeout: const Duration(minutes: 3)),
+      );
+      final data = Map<String, dynamic>.from(resp.data as Map);
+      final apks = data['apks'] is List ? data['apks'] as List : const [];
+      setState(() {
+        _githubStatus = 'Downloaded ${apks.length} APK artifact(s).';
+      });
+      await _fetchBuilds();
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _githubStatus =
+              'Artifact download failed: ${_briefErrorMessage(e)}',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _githubBusy = false);
+    }
+  }
+
+  Future<void> _saveAgentSettings() async {
+    final profiles = _computerProfiles;
+    if (profiles == null) return;
+    final current = profiles.selected;
+    final updated = current.copyWith(
+      agentUrl: _agentUrlController.text.trim(),
+      agentWholeDevice: _agentWholeDevice,
+    );
+    final token = _agentTokenController.text.trim();
+    profiles.updateProfile(updated);
+    await _profileStorage.write(
+      key: current.secretKey('agent_token'),
+      value: token,
+    );
+    final prefs = await SharedPreferences.getInstance();
+    await profiles.save(prefs, _profileStorage);
+    _scheduleServerBackup();
+  }
+
+  Future<void> _applyAgentProfile() async {
+    final profiles = _computerProfiles;
+    if (profiles == null) return;
+    final profile = profiles.selected;
+    final token =
+        await _profileStorage.read(key: profile.secretKey('agent_token')) ?? '';
+    if (!mounted) return;
+    _agentUrlController.text = profile.agentUrl;
+    _agentTokenController.text = token;
+    _agentWholeDevice = profile.agentWholeDevice;
+    setState(() {});
+  }
+
+  Future<void> _selectComputerProfile(String id) async {
+    final profiles = _computerProfiles;
+    if (profiles == null || _computerBusy || id == profiles.selectedId) return;
+    setState(() => _computerBusy = true);
+    try {
+      await _saveAgentSettings();
+      // Park the outgoing computer's macros with it: its terminal stays
+      // connected and keeps auto-running them while another is selected.
+      _stashProfileMacros();
+      profiles.selectedId = id;
+      await profiles.save(
+        await SharedPreferences.getInstance(),
+        _profileStorage,
+      );
+      await _applyAgentProfile();
+      if (!mounted) return;
+      setState(() {
+        _activeServer = profiles.selected.serverUrl;
+        _showProfileMacros(id);
+      });
+      await _saveMacros(syncServer: false);
+      _fetchBuilds();
+      unawaited(_syncMacrosFromServerSilently(id));
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not select computer: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _computerBusy = false);
+    }
+  }
+
+  Future<void> _saveComputerProfile(
+    TerminalProfile profile,
+    bool create,
+  ) async {
+    final profiles = _computerProfiles;
+    if (profiles == null || _computerBusy) return;
+    await _saveAgentSettings();
+    if (create) {
+      profiles.profiles.add(profile);
+      await _selectComputerProfile(profile.id);
+    } else {
+      // Agent fields may have just been saved; preserve them when editing the name/server.
+      profiles.updateProfile(
+        profiles.selected.copyWith(
+          name: profile.name,
+          serverUrl: profile.serverUrl,
+        ),
+      );
+      await profiles.save(
+        await SharedPreferences.getInstance(),
+        _profileStorage,
+      );
+      if (mounted) setState(() => _activeServer = profiles.selected.serverUrl);
+      _fetchBuilds();
+    }
+    _scheduleServerBackup();
+  }
+
+  Future<void> _startAgent() async {
+    final url = _agentUrlController.text.trim();
+    final token = _agentTokenController.text.trim();
+    if (url.isEmpty || token.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Agent URL and token are required')),
+      );
+      return;
+    }
+    setState(() => _agentBusy = true);
+    try {
+      await _saveAgentSettings();
+      await _controlAgentChannel.invokeMethod('startAgent', {
+        'url': url,
+        'token': token,
+        'allowWholeDevice': _agentWholeDevice,
+      });
+      await Future.delayed(const Duration(milliseconds: 350));
+      await _refreshAgentStatus();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Agent start failed: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _agentBusy = false);
+    }
+  }
+
+  Future<void> _stopAgent() async {
+    setState(() => _agentBusy = true);
+    try {
+      await _controlAgentChannel.invokeMethod('stopAgent');
+      await Future.delayed(const Duration(milliseconds: 250));
+      await _refreshAgentStatus();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Agent stop failed: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _agentBusy = false);
+    }
+  }
+
+  Future<void> _refreshAgentStatus() async {
+    try {
+      final raw = await _controlAgentChannel.invokeMapMethod<String, dynamic>(
+        'getAgentStatus',
+      );
+      if (!mounted) return;
+      setState(
+        () =>
+            _agentStatus = raw == null ? null : Map<String, dynamic>.from(raw),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _agentStatus = {'error': e.toString()});
+    }
+  }
+
+  Future<void> _openAccessibilitySettings() async {
+    await _controlAgentChannel.invokeMethod('openAccessibilitySettings');
+  }
+
+  Future<void> _pushToServerClipboard(
+    String text, {
+    String label = 'clipboard',
+  }) async {
+    try {
+      final resp = await _dio.post(
+        '$_baseUrl/clipboard',
+        data: text,
+        options: Options(
+          headers: {'Content-Type': 'text/plain; charset=utf-8'},
+          sendTimeout: const Duration(seconds: 5),
+          receiveTimeout: const Duration(seconds: 5),
+        ),
+      );
+      if (!mounted) return;
+      if (resp.statusCode == 200) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Sent to PC $label'),
+            duration: const Duration(milliseconds: 1100),
+          ),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('PC clipboard returned ${resp.statusCode}')),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('PC clipboard push failed: ${_briefErrorMessage(e)}'),
+        ),
+      );
+    }
+  }
+
+  String get _baseUrl => _activeServer.trim().replaceAll(RegExp(r'/+$'), '');
+
+  void _scheduleServerBackup() {
+    _backupDebounce?.cancel();
+    _backupDebounce = Timer(const Duration(seconds: 2), () {
+      _saveBackupToServerSilently();
+    });
+  }
+
+  Future<void> _saveBackupToServerSilently() async {
+    try {
+      if (!await BackupService.hasLocalRestorableData()) return;
+      await BackupService.saveToServer(_dio, _baseUrl);
+    } catch (_) {
+      // Server backup is opportunistic; local saves should never depend on it.
+    }
+  }
+
+  Future<void> _restoreBackupFromServerIfEmpty() async {
+    final server = _baseUrl;
+    if (_serverRestoreAttemptedFor == server) return;
+    _serverRestoreAttemptedFor = server;
+    try {
+      if (await BackupService.hasLocalRestorableData()) return;
+      final restored = await BackupService.restoreFromServer(_dio, server);
+      if (!restored || !mounted) return;
+      await _reloadImportedSettings();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Restored DevOTA backup from server')),
+      );
+    } catch (_) {
+      // A missing/unreachable backup is normal on first setup.
+    }
+  }
+
+  Future<void> _loadServers() =>
+      _connectionsLoad ??= _loadComputerConnections();
+
+  Future<void> _loadComputerConnections() async {
+    final prefs = await SharedPreferences.getInstance();
+    final profiles = await TerminalProfiles.loadComputers(
+      prefs,
+      _profileStorage,
+      defaultServerUrl: _defaultServerUrl,
+    );
+    if (!mounted) return;
+    setState(() {
+      _computerProfiles = profiles;
+      _servers = prefs.getStringList('servers') ?? [];
+      _activeServer = profiles.selected.serverUrl;
+    });
+    await _applyAgentProfile();
+    _fetchBuilds();
+    _restoreBackupFromServerIfEmpty();
+  }
+
+  void _addAndSelectServer(String url) {
+    final profiles = _computerProfiles;
+    if (profiles == null) return;
+    final clean = url.trim().replaceAll(RegExp(r'/+$'), '');
+    final host = Uri.tryParse(clean)?.host ?? '';
+    if (host.isEmpty) return;
+    final existing = profiles.profiles
+        .where(
+          (profile) =>
+              profile.serverUrl == clean ||
+              profile.host.toLowerCase() == host.toLowerCase(),
+        )
+        .firstOrNull;
+    if (existing != null) {
+      profiles.updateProfile(existing.copyWith(serverUrl: clean));
+      if (existing.id == profiles.selectedId) {
+        _saveComputerProfile(existing.copyWith(serverUrl: clean), false);
+      } else {
+        _selectComputerProfile(existing.id);
+      }
+    } else {
+      _saveComputerProfile(
+        TerminalProfile(
+          id: DateTime.now().microsecondsSinceEpoch.toString(),
+          name: host,
+          host: host,
+          serverUrl: clean,
+        ),
+        true,
+      );
+    }
+  }
+
+  Future<void> _fetchBuilds() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    // Refresh also wipes the local APK cache. Yesterday's APK and
+    // today's APK can share the filename `app-debug.apk`, and the
+    // installer's "install from cache" path skips the redownload —
+    // so without nuking the cache here, the user clicks "install"
+    // after a refresh and still gets the old build. The whole reason
+    // they tapped refresh is to get the latest.
+    await _clearApkCache();
+    try {
+      final resp = await _dio.get(
+        '$_baseUrl/builds',
+        queryParameters: {'t': DateTime.now().millisecondsSinceEpoch},
+        options: Options(
+          headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
+        ),
+      );
+      final data = resp.data as List;
+      final builds = data.cast<Map<String, dynamic>>();
+      setState(() {
+        _builds = builds;
+        _loading = false;
+      });
+      _refreshInstalledPackages(builds);
+    } catch (e) {
+      setState(() {
+        _error = _briefErrorMessage(e);
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _clearApkCache() async {
+    try {
+      final dir = await _getApkCacheDir();
+      for (final f in dir.listSync().whereType<File>()) {
+        if (f.path.endsWith('.apk') || f.path.endsWith('.apk.gz')) {
+          try {
+            await f.delete();
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    await _refreshCachedApks();
+  }
+
+  String _briefErrorMessage(Object e) {
+    if (e is DioException) {
+      switch (e.type) {
+        case DioExceptionType.connectionError:
+          return 'Cannot reach server.';
+        case DioExceptionType.connectionTimeout:
+          return 'Connection timed out.';
+        case DioExceptionType.receiveTimeout:
+          return 'Server did not respond in time.';
+        case DioExceptionType.sendTimeout:
+          return 'Send timed out.';
+        case DioExceptionType.badResponse:
+          final code = e.response?.statusCode;
+          return code != null ? 'Server returned HTTP $code.' : 'Bad response.';
+        case DioExceptionType.cancel:
+          return 'Request cancelled.';
+        case DioExceptionType.badCertificate:
+          return 'Bad TLS certificate.';
+        case DioExceptionType.unknown:
+          break;
+      }
+      return e.message ?? 'Network error.';
+    }
+    final s = e.toString();
+    return s.length > 200 ? '${s.substring(0, 200)}…' : s;
+  }
+
+  String _formatSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  Future<Map<String, dynamic>> _downloadAndInstall(
+    Map<String, dynamic> build, {
+    bool throwOnError = false,
+  }) async {
+    final path = build['path'] as String;
+    final cacheFileName = _cacheFileName(build);
+
+    if (_downloading[path] == true) {
+      throw StateError('build download is already in progress: $path');
+    }
+
+    final stopwatch = Stopwatch()..start();
+    _downloadTimers[path] = stopwatch;
+
+    setState(() {
+      _downloading[path] = true;
+      _downloadProgress[path] = 0;
+      _downloadStatus[path] = 'Downloading... 0s';
+    });
+
+    try {
+      final cacheDir = await _getApkCacheDir();
+      final gzPath = '${cacheDir.path}/$cacheFileName.gz';
+      final apkPath = '${cacheDir.path}/$cacheFileName';
+
+      // Download compressed .gz
+      await _dio.download(
+        '$_baseUrl/download/$path',
+        gzPath,
+        onReceiveProgress: (received, total) {
+          if (total > 0) {
+            final elapsed = stopwatch.elapsed.inSeconds;
+            setState(() {
+              _downloadProgress[path] = received / total * 0.9;
+              _downloadStatus[path] = 'Downloading... ${elapsed}s';
+            });
+          }
+        },
+      );
+
+      final downloadSecs = stopwatch.elapsed.inSeconds;
+
+      // Decompress .gz -> .apk
+      setState(() {
+        _downloadStatus[path] =
+            'Decompressing... (downloaded in ${downloadSecs}s)';
+        _downloadProgress[path] = 0.9;
+      });
+
+      final gzFile = File(gzPath);
+      final apkFile = File(apkPath);
+      final gzBytes = await gzFile.readAsBytes();
+      final decompressed = gzip.decode(gzBytes);
+      await apkFile.writeAsBytes(decompressed);
+      await gzFile.delete();
+
+      stopwatch.stop();
+      final totalSecs = stopwatch.elapsed.inSeconds;
+
+      setState(() {
+        _downloading[path] = false;
+        _downloadProgress.remove(path);
+        _downloadStatus.remove(path);
+        _downloadTimers.remove(path);
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Done in ${totalSecs}s (download: ${downloadSecs}s, decompress: ${totalSecs - downloadSecs}s)',
+            ),
+          ),
+        );
+      }
+
+      await _refreshCachedApks();
+      final result = await OpenFilex.open(
+        apkPath,
+        type: 'application/vnd.android.package-archive',
+      );
+      if (result.type != ResultType.done && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not open installer: ${result.message}'),
+          ),
+        );
+      } else if (result.type == ResultType.done) {
+        await _recordBuildUse(build);
+      }
+      if (result.type != ResultType.done) {
+        throw StateError('could not open installer: ${result.message}');
+      }
+      await Future.delayed(const Duration(milliseconds: 500));
+      await _refreshInstalledPackages();
+      return {
+        'ok': true,
+        'appId': _buildAppId(build),
+        'path': path,
+        'packageName': _buildPackageName(build),
+        'installerOpened': true,
+      };
+    } catch (e) {
+      setState(() {
+        _downloading[path] = false;
+        _downloadProgress.remove(path);
+        _downloadStatus.remove(path);
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Download failed: $e')));
+      }
+      if (throwOnError) rethrow;
+      return {'ok': false, 'path': path, 'error': e.toString()};
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final hideShellChrome =
+        _terminalFullscreen && _tabController.index == _terminalTabIndex;
+    return Scaffold(
+      appBar: hideShellChrome
+          ? null
+          : AppBar(
+              toolbarHeight: _appToolbarHeight,
+              titleSpacing: 12,
+              title: Text(
+                'DevOTA',
+                style: theme.textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              actions: [
+                AnimatedBuilder(
+                  animation: _tabController,
+                  builder: (context, _) {
+                    if (_tabController.index != 1) {
+                      return const SizedBox.shrink();
+                    }
+                    return SizedBox(
+                      width: _appToolbarHeight,
+                      height: _appToolbarHeight,
+                      child: IconButton(
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        icon: const Icon(Icons.refresh, size: 20),
+                        onPressed: _loading ? null : _fetchBuilds,
+                      ),
+                    );
+                  },
+                ),
+              ],
+              bottom: PreferredSize(
+                preferredSize: const Size.fromHeight(_tabStripHeight),
+                child: SizedBox(
+                  height: _tabStripHeight,
+                  child: TabBar(
+                    controller: _tabController,
+                    isScrollable: true,
+                    tabAlignment: TabAlignment.start,
+                    indicatorSize: TabBarIndicatorSize.label,
+                    labelPadding: const EdgeInsets.symmetric(horizontal: 8),
+                    labelStyle: theme.textTheme.labelSmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                    unselectedLabelStyle: theme.textTheme.labelSmall,
+                    tabs: const [
+                      _CompactTab(icon: Icons.wifi_tethering, label: 'Connect'),
+                      _CompactTab(icon: Icons.android, label: 'Builds'),
+                      _CompactTab(icon: Icons.view_kanban, label: 'Projects'),
+                      _CompactTab(icon: Icons.terminal, label: 'Terminal'),
+                      _CompactTab(icon: Icons.terminal, label: 'Commands'),
+                      _CompactTab(icon: Icons.playlist_play, label: 'Macros'),
+                      _CompactTab(icon: Icons.replay, label: 'QA replays'),
+                      _CompactTab(icon: Icons.hub, label: 'Agent'),
+                      _CompactTab(icon: Icons.sync, label: 'Backup'),
+                      _CompactTab(
+                        icon: Icons.download_for_offline,
+                        label: 'Files',
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+      body: Column(
+        children: [
+          // The terminal tab draws its own (richer) banner right above the
+          // locked controls, so only the other tabs need this strip.
+          if (_tabController.index != _terminalTabIndex)
+            _buildMacroRunningStrip(theme),
+          Expanded(child: _buildTabViews(hideShellChrome)),
+        ],
+      ),
+    );
+  }
+
+  /// Shown on every non-terminal tab while a macro is running: a macro drives
+  /// the shared SSH session, so anything typed or tapped anywhere lands inside
+  /// its sequence. Also carries the Stop the terminal tab offers.
+  Widget _buildMacroRunningStrip(ThemeData theme) {
+    final progress = _visibleMacroProgress;
+    if (progress == null) return const SizedBox.shrink();
+    final scheme = theme.colorScheme;
+    return Material(
+      color: scheme.tertiaryContainer,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: scheme.onTertiaryContainer,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    progress.stopping
+                        ? 'Stopping ${progress.macroName}...'
+                        : _deviceMacroRunning
+                        ? '${progress.macroName}  •  ${progress.stepLabel}  •  '
+                              'device integration test is controlling this phone'
+                        : '${progress.macroName}  •  ${progress.stepLabel}  •  '
+                              'wait before touching the terminal',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: scheme.onTertiaryContainer,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                TextButton(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    foregroundColor: scheme.onTertiaryContainer,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  onPressed: progress.stopping
+                      ? null
+                      : _deviceMacroRunning
+                      ? () => setState(() => _deviceMacroStopRequested = true)
+                      : !_macroController.canStop
+                      ? null
+                      : _macroController.requestStop,
+                  child: const Text('Stop'),
+                ),
+              ],
+            ),
+          ),
+          LinearProgressIndicator(
+            value: progress.fraction,
+            minHeight: 2,
+            backgroundColor: scheme.onTertiaryContainer.withValues(alpha: 0.15),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTabViews(bool hideShellChrome) {
+    return TabBarView(
+      controller: _tabController,
+      physics: hideShellChrome ? const NeverScrollableScrollPhysics() : null,
+      children: [
+        ConnectTab(
+          channel: _controlAgentChannel,
+          servers: _servers,
+          activeServer: _activeServer,
+          onServerSelected: _addAndSelectServer,
+          profileManager: _computerProfiles == null
+              ? null
+              : ComputerProfilesPanel(
+                  profiles: _computerProfiles!,
+                  busy: _computerBusy,
+                  onSelect: _selectComputerProfile,
+                  onSave: _saveComputerProfile,
+                ),
+        ),
+        _buildBuildsTab(),
+        ProjectsTab(dio: _dio, serverUrl: _baseUrl),
+        SshTerminalSessions(
+          key: const PageStorageKey('ssh-terminal-tab'),
+          macrosFor: _macrosForProfile,
+          onMacroUsedFor: _recordMacroUseFor,
+          terminal: SshTerminalTab(
+            dio: _dio,
+            serverUrl: _baseUrl,
+            profiles: _computerProfiles,
+            onSelectProfile: (id, create) async {
+              if (create != null) {
+                await _saveComputerProfile(create, true);
+              } else {
+                await _selectComputerProfile(id);
+              }
+            },
+            fullscreen: _terminalFullscreen,
+            quickCommands: _quickCommands,
+            quickMacros: _quickMacros,
+            notificationMacros: _rankedMacros
+                .where((m) => !m.isDeviceMacro)
+                .toList(),
+            macroController: _macroController,
+            onFullscreenChanged: _setTerminalFullscreen,
+            onCommandUsed: _recordCommandUse,
+            onMacroUsed: _recordMacroUse,
+            onMacroReorder: _repositionQuickMacro,
+            onZeroTierRecovery:
+                _macros.any(
+                  (macro) =>
+                      macro.name == zeroTierRecoveryMacroName &&
+                      macro.isDeviceMacro,
+                )
+                ? _runZeroTierRecoveryMacro
+                : null,
+          ),
+        ),
+        _buildCommandsTab(),
+        _buildMacrosTab(),
+        _buildMacrosTab(qaReplay: true),
+        _buildAgentTab(),
+        BackupTab(
+          dio: _dio,
+          serverUrl: _baseUrl,
+          onImported: _reloadImportedSettings,
+        ),
+        FilesTab(dio: _dio, serverUrl: _baseUrl),
+      ],
+    );
+  }
+
+  Future<void> _reloadImportedSettings() async {
+    _connectionsLoad = null;
+    await _loadServers();
+    await _loadIssues();
+    await _loadCommands();
+    await _loadMacros();
+    await _loadTerminalFullscreenPreference();
+    await _loadAgentSettings();
+    await _loadGithubSettings();
+  }
+
+  Widget _buildBuildsTab() {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Expanded(
+                child: InputDecorator(
+                  decoration: const InputDecoration(
+                    labelText: 'Computer',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                  ),
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<String>(
+                      value: _computerProfiles?.selectedId,
+                      isExpanded: true,
+                      isDense: true,
+                      items:
+                          (_computerProfiles?.profiles ?? <TerminalProfile>[])
+                              .map(
+                                (profile) => DropdownMenuItem(
+                                  value: profile.id,
+                                  child: Text(
+                                    profile.name,
+                                    overflow: TextOverflow.ellipsis,
+                                    maxLines: 1,
+                                  ),
+                                ),
+                              )
+                              .toList(),
+                      onChanged: (v) {
+                        if (v != null) _selectComputerProfile(v);
+                      },
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton.filledTonal(
+                icon: const Icon(Icons.refresh),
+                tooltip: 'Refresh builds',
+                onPressed: _loading ? null : _fetchBuilds,
+              ),
+              const SizedBox(width: 8),
+              IconButton.filled(
+                icon: const Icon(Icons.dns),
+                tooltip: 'Manage computers',
+                onPressed: () => _tabController.animateTo(0),
+              ),
+            ],
+          ),
+        ),
+        _buildGithubActionsPanel(),
+        Expanded(child: _buildBody()),
+        _buildNotesSection(),
+      ],
+    );
+  }
+
+  Widget _buildGithubActionsPanel() {
+    final subtitle = _githubStatus ?? 'Run workflow and download APK artifacts';
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      child: Card(
+        margin: EdgeInsets.zero,
+        child: ExpansionTile(
+          leading: const Icon(Icons.cloud_download),
+          title: const Text('GitHub Actions'),
+          subtitle: Text(
+            subtitle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+          children: [
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final narrow = constraints.maxWidth < 620;
+                final fields = [
+                  _buildGithubTextField(
+                    controller: _githubRepoController,
+                    label: 'Repo',
+                    hint: 'owner/name',
+                  ),
+                  _buildGithubTextField(
+                    controller: _githubWorkflowController,
+                    label: 'Workflow',
+                    hint: 'android.yml',
+                  ),
+                  _buildGithubTextField(
+                    controller: _githubRefController,
+                    label: 'Ref',
+                    hint: 'main',
+                  ),
+                  _buildGithubTextField(
+                    controller: _githubArtifactController,
+                    label: 'Artifact',
+                    hint: 'devota-android-apks',
+                  ),
+                ];
+                if (narrow) {
+                  return Column(
+                    children: [
+                      for (var i = 0; i < fields.length; i++) ...[
+                        fields[i],
+                        if (i != fields.length - 1) const SizedBox(height: 8),
+                      ],
+                    ],
+                  );
+                }
+                return Column(
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(child: fields[0]),
+                        const SizedBox(width: 8),
+                        Expanded(child: fields[1]),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(child: fields[2]),
+                        const SizedBox(width: 8),
+                        Expanded(child: fields[3]),
+                      ],
+                    ),
+                  ],
+                );
+              },
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                FilledButton.icon(
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text('Run'),
+                  onPressed: _githubBusy ? null : _runGithubWorkflow,
+                ),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Runs'),
+                  onPressed: _githubBusy ? null : _refreshGithubRuns,
+                ),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.download),
+                  label: const Text('Latest'),
+                  onPressed: _githubBusy
+                      ? null
+                      : () => _downloadGithubArtifact(),
+                ),
+              ],
+            ),
+            if (_githubBusy)
+              const Padding(
+                padding: EdgeInsets.only(top: 10),
+                child: LinearProgressIndicator(),
+              ),
+            if (_githubRuns.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              ..._githubRuns.take(3).map(_buildGithubRunTile),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGithubTextField({
+    required TextEditingController controller,
+    required String label,
+    required String hint,
+  }) {
+    return TextField(
+      controller: controller,
+      decoration: InputDecoration(
+        labelText: label,
+        hintText: hint,
+        border: const OutlineInputBorder(),
+        isDense: true,
+      ),
+      keyboardType: label == 'Repo' ? TextInputType.url : TextInputType.text,
+      textInputAction: TextInputAction.next,
+      onChanged: (_) => _saveGithubSettings(),
+    );
+  }
+
+  Widget _buildGithubRunTile(Map<String, dynamic> run) {
+    final title = (run['displayTitle'] ?? 'Workflow run').toString();
+    final status = (run['status'] ?? 'unknown').toString();
+    final conclusion = run['conclusion']?.toString();
+    final branch = run['headBranch']?.toString();
+    final updated = run['updatedAt']?.toString();
+    final runId = _asInt(run['databaseId']);
+    final isSuccess = conclusion == 'success';
+    final subtitleParts = [
+      status,
+      if (conclusion != null && conclusion.isNotEmpty) conclusion,
+      if (branch != null && branch.isNotEmpty) branch,
+      if (updated != null && updated.isNotEmpty) updated,
+    ];
+    return ListTile(
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(
+        isSuccess
+            ? Icons.check_circle
+            : status == 'in_progress'
+            ? Icons.pending
+            : Icons.history,
+      ),
+      title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+      subtitle: Text(
+        subtitleParts.join('  •  '),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: IconButton(
+        icon: const Icon(Icons.download),
+        tooltip: 'Download artifact',
+        onPressed: _githubBusy || !isSuccess || runId == null
+            ? null
+            : () => _downloadGithubArtifact(runId: runId),
+      ),
+    );
+  }
+
+  Widget _buildCommandsTab() {
+    final rankedCommands = _rankedCommands;
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _commandController,
+                  decoration: const InputDecoration(
+                    labelText: 'New command',
+                    hintText: 'e.g. claude --dangerously-skip-permissions',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                  minLines: 1,
+                  maxLines: 4,
+                  style: const TextStyle(fontFamily: 'monospace'),
+                  textInputAction: TextInputAction.done,
+                  onSubmitted: (_) => _addCommand(),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton.filled(
+                icon: const Icon(Icons.add),
+                onPressed: _addCommand,
+                tooltip: 'Add command',
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: rankedCommands.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      'No commands yet.\nAdd one above, then tap to copy.',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 4,
+                  ),
+                  itemCount: rankedCommands.length,
+                  itemBuilder: (context, index) {
+                    final cmd = rankedCommands[index];
+                    final uses = _commandUseCounts[cmd] ?? 0;
+                    return Card(
+                      child: InkWell(
+                        onTap: () => _copyCommand(cmd),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.center,
+                            children: [
+                              Expanded(
+                                child: SelectableText(
+                                  cmd,
+                                  style: const TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 13,
+                                  ),
+                                ),
+                              ),
+                              if (uses > 0) ...[
+                                const SizedBox(width: 6),
+                                Tooltip(
+                                  message: 'Uses',
+                                  child: Chip(
+                                    visualDensity: VisualDensity.compact,
+                                    label: Text('$uses'),
+                                  ),
+                                ),
+                              ],
+                              IconButton(
+                                icon: const Icon(Icons.copy, size: 20),
+                                tooltip: 'Copy to phone clipboard',
+                                onPressed: () => _copyCommand(cmd),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.computer, size: 20),
+                                tooltip: 'Push to PC clipboard',
+                                onPressed: () =>
+                                    _pushCommandToServerClipboard(cmd),
+                              ),
+                              IconButton(
+                                icon: const Icon(
+                                  Icons.delete_outline,
+                                  size: 20,
+                                ),
+                                tooltip: 'Delete',
+                                onPressed: () => _removeCommandValue(cmd),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMacrosTab({bool qaReplay = false}) {
+    final rankedMacros = _rankedMacros
+        .where((macro) => macro.isDeviceMacro == qaReplay)
+        .toList();
+    final progress = _visibleMacroProgress;
+    final running = _anyMacroRunning;
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  _repositioningMacro
+                      ? 'Repositioning — drag to move one slot, flick to send '
+                            'it to the top or bottom.'
+                      : progress != null
+                      ? 'Running ${progress.macroName} — ${progress.stepLabel}'
+                      : !qaReplay || _lastDeviceMacroRunId == null
+                      ? qaReplay
+                            ? 'Hold a replay to reposition it. Run visible '
+                                  'device tests and collect evidence.'
+                            : 'Hold a macro to reposition it. Create terminal '
+                                  'authoring sequences.'
+                      : 'Last device evidence: $_lastDeviceMacroRunId',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton.icon(
+                icon: const Icon(Icons.add),
+                label: Text(qaReplay ? 'Replay' : 'Macro'),
+                onPressed: () => _addMacro(qaReplay: qaReplay),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: rankedMacros.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      qaReplay
+                          ? 'No QA replays yet.\nAdd visible device-test steps.'
+                          : 'No authoring macros yet.\nAdd terminal authoring steps.',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                )
+              : MacroReorderableList(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 4,
+                  ),
+                  itemCount: rankedMacros.length,
+                  itemKey: (index) => ValueKey(rankedMacros[index].id),
+                  onRepositionStart: (_) =>
+                      setState(() => _repositioningMacro = true),
+                  onRepositionEnd: (_) {
+                    if (mounted) setState(() => _repositioningMacro = false);
+                  },
+                  onReposition: (fromIndex, toIndex) {
+                    final target = toIndex.clamp(0, rankedMacros.length - 1);
+                    final targetRank = _rankedMacros.indexWhere(
+                      (macro) => macro.id == rankedMacros[target].id,
+                    );
+                    _moveMacroToRank(rankedMacros[fromIndex].id, targetRank);
+                  },
+                  itemBuilder: (context, index) {
+                    final macro = rankedMacros[index];
+                    final uses = _macroUseCounts[macro.id] ?? 0;
+                    final isRunningMacro =
+                        progress != null && progress.macroName == macro.name;
+                    return Card(
+                      child: ExpansionTile(
+                        leading: isRunningMacro
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.playlist_play),
+                        title: Text(macro.name),
+                        subtitle: Text(
+                          '${macro.steps.length} step${macro.steps.length == 1 ? '' : 's'}'
+                          '${uses > 0 ? '  •  $uses uses' : ''}',
+                        ),
+                        childrenPadding: const EdgeInsets.fromLTRB(
+                          12,
+                          0,
+                          12,
+                          10,
+                        ),
+                        children: [
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              FilledButton.icon(
+                                icon: const Icon(Icons.play_arrow),
+                                label: const Text('Run'),
+                                onPressed: running
+                                    ? null
+                                    : () => _runMacroFromMacrosTab(macro),
+                              ),
+                              OutlinedButton.icon(
+                                icon: const Icon(Icons.edit),
+                                label: const Text('Edit'),
+                                onPressed: () => _editMacro(macro),
+                              ),
+                              IconButton.outlined(
+                                icon: const Icon(Icons.copy),
+                                tooltip: 'Duplicate',
+                                onPressed: () => _duplicateMacro(macro),
+                              ),
+                              IconButton.outlined(
+                                icon: const Icon(Icons.delete_outline),
+                                tooltip: 'Delete',
+                                onPressed: () => _removeMacro(macro),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          for (final step in macro.steps)
+                            Align(
+                              alignment: Alignment.centerLeft,
+                              child: Padding(
+                                padding: const EdgeInsets.only(bottom: 4),
+                                child: Text(
+                                  _macroStepSummary(step),
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(fontFamily: 'monospace'),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  String _macroStepSummary(TerminalMacroStep step) {
+    final delay = step.delaySeconds > 0
+        ? '  +${step.delaySeconds.toStringAsFixed(step.delaySeconds.truncateToDouble() == step.delaySeconds ? 0 : 1)}s'
+        : '';
+    return switch (step.type) {
+      TerminalMacroStepType.shell => r'$ ' + step.value + delay,
+      TerminalMacroStepType.terminalKey =>
+        'key ${terminalMacroStepValueLabel(step)}$delay',
+      TerminalMacroStepType.tmux =>
+        'tmux ${terminalMacroStepValueLabel(step)}$delay',
+      TerminalMacroStepType.wait => 'wait$delay',
+      TerminalMacroStepType.device => _deviceMacroStepSummary(step, delay),
+    };
+  }
+
+  String _deviceMacroStepSummary(TerminalMacroStep step, String delay) {
+    try {
+      final decoded = jsonDecode(step.value);
+      if (decoded is Map) {
+        final action = decoded['action']?.toString() ?? 'device';
+        final label = decoded['label']?.toString();
+        return '${label?.trim().isNotEmpty == true ? label : action}$delay';
+      }
+    } catch (_) {}
+    return 'device (invalid JSON)$delay';
+  }
+
+  Future<TerminalMacro?> _showMacroEditor(
+    TerminalMacro macro, {
+    bool isNew = false,
+  }) {
+    return Navigator.of(context).push<TerminalMacro>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => MacroEditorScreen(
+          macro: macro,
+          savedCommands: _rankedCommands.take(12).toList(),
+          isNew: isNew,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAgentTab() {
+    final status = _agentStatus ?? const <String, dynamic>{};
+    final accessibility = status['accessibility'] is Map
+        ? Map<String, dynamic>.from(status['accessibility'] as Map)
+        : const <String, dynamic>{};
+    final running = status['running'] == true;
+    final connected = status['connected'] == true;
+    final accessibilityEnabled = accessibility['enabled'] == true;
+    final lastError = status['lastError']?.toString();
+
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        Text('Computer: ${_computerProfiles?.selected.name ?? 'Loading…'}'),
+        TextButton(
+          onPressed: () => _tabController.animateTo(0),
+          child: const Text('Manage computers in Connect'),
+        ),
+        const SizedBox(height: 10),
+        TextField(
+          controller: _agentUrlController,
+          decoration: const InputDecoration(
+            labelText: 'Agent WebSocket URL',
+            hintText: 'ws://<computer-ip>:8083/phone',
+            border: OutlineInputBorder(),
+          ),
+          keyboardType: TextInputType.url,
+          textInputAction: TextInputAction.next,
+          onChanged: (_) => _saveAgentSettings(),
+        ),
+        const SizedBox(height: 10),
+        TextField(
+          controller: _agentTokenController,
+          decoration: const InputDecoration(
+            labelText: 'Pair token',
+            border: OutlineInputBorder(),
+          ),
+          obscureText: true,
+          textInputAction: TextInputAction.done,
+          onChanged: (_) => _saveAgentSettings(),
+        ),
+        const SizedBox(height: 8),
+        SwitchListTile(
+          title: const Text('Whole-device control'),
+          subtitle: const Text('Requires the MCP server env flag too'),
+          value: _agentWholeDevice,
+          onChanged: (v) {
+            setState(() => _agentWholeDevice = v);
+            _saveAgentSettings();
+          },
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            FilledButton.icon(
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('Start'),
+              onPressed: _agentBusy ? null : _startAgent,
+            ),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.stop),
+              label: const Text('Stop'),
+              onPressed: _agentBusy ? null : _stopAgent,
+            ),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.accessibility_new),
+              label: const Text('Accessibility'),
+              onPressed: _openAccessibilitySettings,
+            ),
+            IconButton.filledTonal(
+              icon: const Icon(Icons.refresh),
+              tooltip: 'Refresh status',
+              onPressed: _refreshAgentStatus,
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _statusRow(
+                  'Service',
+                  running ? 'running' : 'stopped',
+                  running ? Icons.check_circle : Icons.radio_button_unchecked,
+                ),
+                _statusRow(
+                  'Relay',
+                  connected ? 'connected' : 'disconnected',
+                  connected ? Icons.link : Icons.link_off,
+                ),
+                _statusRow(
+                  'Accessibility',
+                  accessibilityEnabled ? 'enabled' : 'disabled',
+                  accessibilityEnabled
+                      ? Icons.visibility
+                      : Icons.visibility_off,
+                ),
+                if (accessibility['activePackage'] != null)
+                  _statusRow(
+                    'Package',
+                    accessibility['activePackage'].toString(),
+                    Icons.apps,
+                  ),
+                if (lastError != null && lastError.isNotEmpty)
+                  _statusRow('Error', lastError, Icons.error_outline),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _statusRow(String label, String value, IconData icon) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 18),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 92,
+            child: Text(
+              label,
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+          Expanded(child: SelectableText(value)),
+        ],
+      ),
+    );
+  }
+
+  String _buildAppId(Map<String, dynamic> build) {
+    return (build['appId'] ?? build['kind'] ?? 'builds').toString();
+  }
+
+  String _buildAppLabel(Map<String, dynamic> build) {
+    final label = build['appLabel'] ?? build['label'];
+    if (label != null && label.toString().trim().isNotEmpty) {
+      return label.toString();
+    }
+    return _buildAppId(build);
+  }
+
+  int? _asInt(Object? value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    if (value is String) return int.tryParse(value);
+    return null;
+  }
+
+  Map<String, List<Map<String, dynamic>>> _groupBuildsByApp() {
+    final grouped = <String, List<Map<String, dynamic>>>{};
+    for (final build in _builds) {
+      grouped.putIfAbsent(_buildAppId(build), () => []).add(build);
+    }
+    for (final builds in grouped.values) {
+      builds.sort(_compareBuildsForDisplay);
+    }
+    return grouped;
+  }
+
+  int _compareBuildsForDisplay(Map<String, dynamic> a, Map<String, dynamic> b) {
+    final aPath = _buildPath(a);
+    final bPath = _buildPath(b);
+    if (_lastUsedBuildPath != null) {
+      final aLast = aPath == _lastUsedBuildPath;
+      final bLast = bPath == _lastUsedBuildPath;
+      if (aLast != bLast) return aLast ? -1 : 1;
+    }
+    final aModified = _asInt(a['modifiedMs']) ?? 0;
+    final bModified = _asInt(b['modifiedMs']) ?? 0;
+    final modified = bModified.compareTo(aModified);
+    if (modified != 0) return modified;
+    return aPath.compareTo(bPath);
+  }
+
+  int _compareBuildAppIds(
+    String a,
+    String b,
+    Map<String, List<Map<String, dynamic>>> grouped,
+  ) {
+    if (_lastUsedBuildAppId != null) {
+      final aLast = a == _lastUsedBuildAppId;
+      final bLast = b == _lastUsedBuildAppId;
+      if (aLast != bLast) return aLast ? -1 : 1;
+    }
+    return _buildAppLabel(
+      grouped[a]!.first,
+    ).compareTo(_buildAppLabel(grouped[b]!.first));
+  }
+
+  Widget _buildBody() {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.error_outline, size: 48, color: Colors.red),
+              const SizedBox(height: 12),
+              Text(
+                'Connection failed',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                _error!,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    if (_builds.isEmpty) {
+      return const Center(
+        child: Text(
+          'No APK builds found.\nCheck devota.yaml and build the target app.',
+          textAlign: TextAlign.center,
+        ),
+      );
+    }
+    final grouped = _groupBuildsByApp();
+    final hasLastUsedApp =
+        _lastUsedBuildAppId != null && grouped.containsKey(_lastUsedBuildAppId);
+    final appIds = grouped.keys.toList()
+      ..sort((a, b) => _compareBuildAppIds(a, b, grouped));
+    return ListView.builder(
+      itemCount: appIds.length,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      itemBuilder: (context, index) {
+        final appId = appIds[index];
+        final appBuilds = grouped[appId]!;
+        final label = _buildAppLabel(appBuilds.first);
+        final latest = appBuilds.first;
+        final shouldExpand =
+            appId == _lastUsedBuildAppId || (!hasLastUsedApp && index == 0);
+        return Card(
+          child: ExpansionTile(
+            key: ValueKey('build-app-$appId-$shouldExpand'),
+            leading: const Icon(Icons.apps),
+            title: Text(label),
+            subtitle: Text(
+              '${appBuilds.length} build${appBuilds.length == 1 ? '' : 's'}'
+              '  •  latest ${latest['modified']}',
+            ),
+            initiallyExpanded: shouldExpand,
+            children: appBuilds.map(_buildBuildTile).toList(),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildBuildTile(Map<String, dynamic> build) {
+    final path = build['path'] as String;
+    final filename = build['filename'] as String;
+    final isDownloading = _downloading[path] == true;
+    final progress = _downloadProgress[path];
+    final status = _downloadStatus[path];
+    final size = _asInt(build['size']) ?? 0;
+    final compressedSize = _asInt(build['compressed_size']);
+    final isCached = _cachedApks.contains(_cacheFileName(build));
+    final packageName = _buildPackageName(build);
+    final isInstalled =
+        packageName.isNotEmpty && _installedPackages.contains(packageName);
+
+    Widget trailing;
+    if (isDownloading) {
+      trailing = const SizedBox(
+        width: 24,
+        height: 24,
+        child: CircularProgressIndicator(strokeWidth: 2),
+      );
+    } else if (isCached) {
+      trailing = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (isInstalled)
+            IconButton(
+              icon: const Icon(Icons.open_in_new),
+              tooltip: 'Open installed app',
+              onPressed: () => _openInstalledBuildApp(build),
+            ),
+          IconButton(
+            icon: const Icon(Icons.install_mobile),
+            tooltip: 'Install cached APK',
+            onPressed: () => _installCachedApk(build),
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete_outline),
+            tooltip: 'Delete cached APK',
+            onPressed: () => _deleteCachedApk(build),
+          ),
+        ],
+      );
+    } else {
+      trailing = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (isInstalled)
+            IconButton(
+              icon: const Icon(Icons.open_in_new),
+              tooltip: 'Open installed app',
+              onPressed: () => _openInstalledBuildApp(build),
+            ),
+          IconButton(
+            icon: const Icon(Icons.download),
+            tooltip: 'Download and install',
+            onPressed: () => _downloadAndInstall(build),
+          ),
+        ],
+      );
+    }
+
+    return ListTile(
+      leading: Icon(
+        isCached ? Icons.android : Icons.android_outlined,
+        color: isCached ? Theme.of(context).colorScheme.primary : null,
+      ),
+      title: Text(filename),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '${_formatSize(size)}'
+            '${compressedSize != null ? '  ->  ${_formatSize(compressedSize)} gz' : ''}'
+            '  •  ${build['modified']}'
+            '${isCached ? '  •  cached' : ''}'
+            '${isInstalled ? '  •  installed' : ''}',
+          ),
+          if (packageName.isNotEmpty)
+            Text(
+              packageName,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                fontFamily: 'monospace',
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          if (isDownloading && status != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  LinearProgressIndicator(value: progress),
+                  const SizedBox(height: 2),
+                  Text(status, style: Theme.of(context).textTheme.bodySmall),
+                ],
+              ),
+            ),
+        ],
+      ),
+      trailing: trailing,
+    );
+  }
+
+  Widget _buildNotesSection() {
+    final media = MediaQuery.of(context);
+    final usable = media.size.height - media.viewInsets.bottom;
+    return Container(
+      constraints: BoxConstraints(maxHeight: usable * 0.4),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 4, 4),
+            child: Row(
+              children: [
+                Text('Issues', style: Theme.of(context).textTheme.titleSmall),
+                const SizedBox(width: 4),
+                Text(
+                  '(${_issues.length})',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                const Spacer(),
+                IconButton(
+                  icon: const Icon(Icons.copy, size: 20),
+                  tooltip: 'Copy all to phone clipboard',
+                  onPressed: _issues.isEmpty ? null : _copyAllIssues,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.computer, size: 20),
+                  tooltip: 'Push all to PC clipboard',
+                  onPressed: _issues.isEmpty
+                      ? null
+                      : () => _pushToServerClipboard(
+                          _issuesAsText(),
+                          label: 'clipboard',
+                        ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.key, size: 20),
+                  tooltip: 'Set OpenAI key',
+                  onPressed: _promptOpenAiKey,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.delete_sweep, size: 20),
+                  tooltip: 'Clear all',
+                  onPressed: _issues.isEmpty
+                      ? null
+                      : () {
+                          showDialog<void>(
+                            context: context,
+                            builder: (ctx) => AlertDialog(
+                              title: const Text('Clear all issues?'),
+                              actions: [
+                                TextButton(
+                                  onPressed: () => Navigator.pop(ctx),
+                                  child: const Text('Cancel'),
+                                ),
+                                TextButton(
+                                  onPressed: () {
+                                    Navigator.pop(ctx);
+                                    _clearAllIssues();
+                                  },
+                                  child: const Text('Clear'),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _noteController,
+                    decoration: const InputDecoration(
+                      hintText: 'Describe an issue...',
+                      border: OutlineInputBorder(),
+                    ),
+                    maxLines: 4,
+                    minLines: 3,
+                    textInputAction: TextInputAction.newline,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton.filled(
+                      icon: Icon(
+                        _isRecording ? Icons.stop : Icons.mic,
+                        color: _isRecording ? Colors.red : null,
+                      ),
+                      tooltip: _isRecording ? 'Stop recording' : 'Voice input',
+                      onPressed: _isTranscribing ? null : _toggleIssueRecording,
+                    ),
+                    const SizedBox(height: 4),
+                    IconButton.filled(
+                      icon: _isTranscribing
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.add),
+                      onPressed: _isTranscribing ? null : _addIssue,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          if (_issues.isNotEmpty)
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+                itemCount: _issues.length,
+                itemBuilder: (context, index) {
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          '${index + 1}. ',
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(fontWeight: FontWeight.bold),
+                        ),
+                        Expanded(child: Text(_issues[index])),
+                        GestureDetector(
+                          onTap: () => _removeIssue(index),
+                          child: const Icon(Icons.close, size: 16),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+          if (_issues.isEmpty)
+            const Padding(padding: EdgeInsets.only(bottom: 12)),
+        ],
+      ),
+    );
+  }
+}
+
+class _CompactTab extends StatelessWidget {
+  const _CompactTab({required this.icon, required this.label});
+
+  final IconData icon;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: _BuildListScreenState._tabStripHeight,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16),
+          const SizedBox(width: 4),
+          Text(label, maxLines: 1, overflow: TextOverflow.fade),
+        ],
+      ),
+    );
+  }
+}

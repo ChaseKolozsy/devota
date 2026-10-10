@@ -1,0 +1,2172 @@
+#!/usr/bin/env node
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import { WebSocketServer } from "ws";
+import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { chmod, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import YAML from "yaml";
+import { compileMacroRecording, sanitizeRecordedArgs } from "./macro_recording.js";
+import { PhoneRegistry } from "./phone_registry.js";
+import { createPrivilegedMacroExecutor } from "./privileged_macro.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const TOOL_ROOT = path.resolve(__dirname, "..");
+const execFileAsync = promisify(execFile);
+const IMAGE_TEMPLATE_HELPER = path.resolve(TOOL_ROOT, "../server/image_templates.py");
+const DEFAULT_DEVOTA_PACKAGE = "io.github.chasekolozsy.devota";
+
+const env = process.env;
+const pairToken = env.DEVOTA_PAIR_TOKEN || randomBytes(12).toString("hex");
+const wsPort = Number.parseInt(env.DEVOTA_WS_PORT || "8083", 10);
+const buildServerUrl = env.DEVOTA_BUILD_SERVER_URL ? stripTrailingSlash(env.DEVOTA_BUILD_SERVER_URL) : null;
+const wholeDeviceEnabled = env.DEVOTA_ENABLE_WHOLE_DEVICE === "1";
+const buildCommandsEnabled = env.DEVOTA_ENABLE_BUILD_COMMANDS === "1";
+const privilegedMacrosEnabled = env.DEVOTA_ENABLE_PRIVILEGED_MACROS === "1";
+const repoRoot = path.resolve(env.DEVOTA_REPO_ROOT || path.resolve(TOOL_ROOT, ".."));
+const manifestPath = path.resolve(repoRoot, env.DEVOTA_MANIFEST || "devota.yaml");
+const artifactRoot = path.resolve(env.DEVOTA_ARTIFACT_DIR || path.join(TOOL_ROOT, "artifacts"));
+const devotaPackage = env.DEVOTA_APP_PACKAGE || DEFAULT_DEVOTA_PACKAGE;
+const macroRecordingRoot = path.join(artifactRoot, "macro-recordings");
+let activeMacroRecording = null;
+
+const uiSelectorSchema = z.object({
+  text: z.string().optional(),
+  textExact: z.string().optional(),
+  contentDescription: z.string().optional(),
+  contentDescriptionExact: z.string().optional(),
+  resourceId: z.string().optional(),
+  resourceIdExact: z.string().optional(),
+  className: z.string().optional(),
+  classNameExact: z.string().optional(),
+  checkable: z.boolean().optional(),
+  checked: z.boolean().optional(),
+  visibleOnly: z.boolean().default(true),
+  centerRegion: z.object({
+    left: z.number().min(0).max(1),
+    top: z.number().min(0).max(1),
+    right: z.number().min(0).max(1),
+    bottom: z.number().min(0).max(1),
+  }).optional(),
+});
+
+const gestureUiSpecSchema = z.union([
+  z.object({ kind: z.literal("tap") }).strict(),
+  z.object({ kind: z.literal("doubleTap") }).strict(),
+  z.object({ kind: z.literal("longTap"), durationMs: z.number().int().min(500).max(5000).optional() }).strict(),
+  z.object({ kind: z.literal("swipe"), dx: z.number(), dy: z.number(), durationMs: z.number().int().min(1).max(5000).optional() }).strict(),
+  z.object({ kind: z.literal("path"), points: z.array(z.object({ dx: z.number(), dy: z.number() }).strict()).min(2).max(64), durationMs: z.number().int().min(80).max(5000) }).strict(),
+]);
+
+const imageTemplateSchema = z.object({
+  format: z.literal("devota-image-template"),
+  version: z.literal(1),
+  pngBase64: z.string().max(600000),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  width: z.number().int().min(8).max(512),
+  height: z.number().int().min(8).max(512),
+  sourceWidth: z.number().int().min(1).max(10000),
+  sourceHeight: z.number().int().min(1).max(10000),
+  expectedCenterX: z.number().min(0).max(1),
+  expectedCenterY: z.number().min(0).max(1),
+  clickOffsetX: z.number().min(0).max(1),
+  clickOffsetY: z.number().min(0).max(1),
+  searchRadiusX: z.number().min(0.02).max(0.5),
+  searchRadiusY: z.number().min(0.02).max(0.5),
+  threshold: z.number().min(0.5).max(0.99),
+});
+
+const macroStepSchema = z.object({
+  id: z.string().optional(),
+  type: z.enum(["shell", "terminalKey", "tmux", "wait", "device"]).default("shell"),
+  value: z.string().default(""),
+  delaySeconds: z.number().min(0).default(0),
+});
+
+function stripTrailingSlash(value) {
+  return String(value || "").replace(/\/+$/, "");
+}
+
+function textResult(value) {
+  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return { content: [{ type: "text", text }] };
+}
+
+function imageResult(base64, details) {
+  return {
+    content: [
+      { type: "text", text: JSON.stringify(details, null, 2) },
+      { type: "image", data: base64, mimeType: "image/png" },
+    ],
+  };
+}
+
+function requireBuildServerUrl() {
+  if (!buildServerUrl) {
+    throw new Error("DEVOTA_BUILD_SERVER_URL is required for DevOTA build-server tools");
+  }
+  return buildServerUrl;
+}
+
+async function buildServerJson(pathname, options = {}) {
+  const base = requireBuildServerUrl();
+  const method = options.method || "GET";
+  const headers = { Accept: "application/json", ...(options.headers || {}) };
+  const init = { method, headers };
+  if (options.data !== undefined) {
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(options.data);
+  }
+  const response = await fetch(`${base}${pathname}`, init);
+  const text = await response.text();
+  let payload = {};
+  if (text.trim()) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { raw: text };
+    }
+  }
+  if (!response.ok) {
+    throw new Error(`DevOTA build server ${method} ${pathname} returned HTTP ${response.status}: ${text.trim()}`);
+  }
+  return payload;
+}
+
+async function buildServerUpload(pathname, { buffer, filename, contentType }) {
+  const base = requireBuildServerUrl();
+  const form = new FormData();
+  const blob = new Blob([buffer], { type: contentType || "application/octet-stream" });
+  form.append("file", blob, filename);
+  const response = await fetch(`${base}${pathname}`, { method: "POST", body: form });
+  const text = await response.text();
+  let payload = {};
+  if (text.trim()) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { raw: text };
+    }
+  }
+  if (!response.ok) {
+    throw new Error(`DevOTA build server POST ${pathname} returned HTTP ${response.status}: ${text.trim()}`);
+  }
+  return payload;
+}
+
+async function downloadBuildServerArtifact(pathname, filename) {
+  const base = requireBuildServerUrl();
+  const response = await fetch(`${base}${pathname}`);
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`DevOTA build server GET ${pathname} returned HTTP ${response.status}: ${detail.trim()}`);
+  }
+  const directory = path.join(artifactRoot, "macro-runs");
+  await mkdir(directory, { recursive: true });
+  const target = path.join(directory, filename.replace(/[^A-Za-z0-9._-]+/g, "-"));
+  await writeFile(target, Buffer.from(await response.arrayBuffer()));
+  return { path: target, bytes: (await stat(target)).size };
+}
+
+async function persistMacroRecording(recording) {
+  await mkdir(macroRecordingRoot, { recursive: true });
+  const target = path.join(macroRecordingRoot, `${recording.id}.json`);
+  await writeFile(target, `${JSON.stringify(recording, null, 2)}\n`);
+  try {
+    await chmod(target, 0o600);
+  } catch {
+    // Windows ACLs remain authoritative when chmod is unavailable.
+  }
+  return target;
+}
+
+function validateRecordingId(recordingId) {
+  const value = String(recordingId || "").trim();
+  if (!/^recording-[A-Za-z0-9._-]+$/.test(value)) {
+    throw new Error("invalid macro recording id");
+  }
+  return value;
+}
+
+async function loadMacroRecording(recordingId) {
+  const id = validateRecordingId(recordingId);
+  const raw = JSON.parse(await readFile(path.join(macroRecordingRoot, `${id}.json`), "utf8"));
+  if (!raw || raw.id !== id || !Array.isArray(raw.entries)) {
+    throw new Error("macro recording file is invalid");
+  }
+  return raw;
+}
+
+async function appendRecordedPhoneAction(action, args, ok, metadata = {}) {
+  if (!activeMacroRecording) return;
+  const entry = {
+    index: activeMacroRecording.entries.length + 1,
+    action,
+    args: sanitizeRecordedArgs(action, args, activeMacroRecording.redactTypedText),
+    ...(metadata.macroAction ? { macroAction: metadata.macroAction } : {}),
+    ...(metadata.macroArgs
+      ? {
+          macroArgs: sanitizeRecordedArgs(
+            metadata.macroAction || action,
+            metadata.macroArgs,
+            activeMacroRecording.redactTypedText,
+          ),
+        }
+      : {}),
+    ...(metadata.label ? { label: metadata.label } : {}),
+    ...(metadata.after ? { after: metadata.after } : {}),
+    ...(metadata.imageTemplateEvidence ? { imageTemplateEvidence: metadata.imageTemplateEvidence } : {}),
+    ...(Number.isFinite(metadata.settleSeconds) ? { settleSeconds: metadata.settleSeconds } : {}),
+    ok,
+    recordedAt: new Date().toISOString(),
+  };
+  activeMacroRecording.entries.push(entry);
+  activeMacroRecording.updatedAt = entry.recordedAt;
+  await persistMacroRecording(activeMacroRecording);
+}
+
+async function withRecordedPhoneAction(action, args, operation, metadata = {}) {
+  try {
+    const result = await operation();
+    await appendRecordedPhoneAction(action, args, true, metadata);
+    return result;
+  } catch (error) {
+    await appendRecordedPhoneAction(action, args, false, metadata);
+    throw error;
+  }
+}
+
+async function compileAndMaybePublishRecording(recording, options = {}) {
+  const draft = compileMacroRecording(recording, options);
+  let published = null;
+  if (options.publish === true) {
+    if (draft.needsReview) {
+      throw new Error("recorded macro still needs review; prune coordinates and replace input placeholders first");
+    }
+    published = await buildServerJson("/macros", {
+      method: "POST",
+      data: {
+        name: draft.name,
+        priority: draft.priority,
+        steps: draft.steps.map(({ id, type, value, delaySeconds }) => ({ id, type, value, delaySeconds })),
+      },
+    });
+  }
+  return { recording, draft, published };
+}
+
+function adbArgs(serial, args) {
+  return serial ? ["-s", serial, ...args] : args;
+}
+
+async function runAdb(args, options = {}) {
+  const { serial, timeout = 30000, encoding = "utf8", maxBuffer = 32 * 1024 * 1024 } = options;
+  const finalArgs = adbArgs(serial, args);
+  return await new Promise((resolve, reject) => {
+    execFile("adb", finalArgs, { timeout, encoding, maxBuffer }, (error, stdout, stderr) => {
+      if (error) {
+        const detail = stderr || stdout || error.message;
+        reject(new Error(`adb ${finalArgs.join(" ")} failed: ${String(detail).trim()}`));
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+async function adbDevices() {
+  const out = await runAdb(["devices", "-l"]);
+  return out
+    .split(/\r?\n/)
+    .slice(1)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [serial, state, ...rest] = line.split(/\s+/);
+      const fields = {};
+      for (const token of rest) {
+        const idx = token.indexOf(":");
+        if (idx > 0) fields[token.slice(0, idx)] = token.slice(idx + 1);
+      }
+      return { serial, state, ...fields };
+    });
+}
+
+const executePrivilegedMacroCommand = createPrivilegedMacroExecutor({
+  enabled: privilegedMacrosEnabled,
+  loadManifest,
+  adbDevices,
+  runAdb,
+  latestBuild,
+  devotaPackage,
+});
+
+const phone = new PhoneRegistry({
+  pairToken,
+  onHostCommand: privilegedMacrosEnabled ? executePrivilegedMacroCommand : null,
+});
+
+const wss = new WebSocketServer({ host: "0.0.0.0", port: wsPort, path: "/phone" });
+wss.on("connection", (socket, request) => phone.attach(socket, request));
+wss.on("listening", () => {
+  const address = wss.address();
+  const actualPort = typeof address === "object" && address ? address.port : wsPort;
+  console.error(`[devota_mcp] phone relay listening on ws://0.0.0.0:${actualPort}/phone`);
+  console.error(`[devota_mcp] pair token: ${env.DEVOTA_PAIR_TOKEN ? "configured" : "generated for this process"}`);
+  console.error(`[devota_mcp] build server URL for phone installs: ${buildServerUrl || "not configured"}`);
+  console.error(`[devota_mcp] privileged host macros: ${privilegedMacrosEnabled ? "enabled" : "disabled"}`);
+});
+
+async function chooseAdbSerial(serial) {
+  if (serial) return serial;
+  const devices = (await adbDevices()).filter((d) => d.state === "device");
+  if (devices.length === 0) throw new Error("no adb device connected");
+  if (devices.length > 1) throw new Error("multiple adb devices connected; pass serial");
+  return devices[0].serial;
+}
+
+function publicApp(app) {
+  return {
+    id: app.id,
+    label: app.label,
+    packageName: app.packageName,
+    notes: app.notes,
+    buildDirs: app.buildDirs.map((entry) => entry.relative),
+    build: app.build,
+  };
+}
+
+async function loadManifest() {
+  const raw = await readFile(manifestPath, "utf8");
+  const data = manifestPath.endsWith(".json") ? JSON.parse(raw) : YAML.parse(raw);
+  if (!data || !Array.isArray(data.apps) || data.apps.length === 0) {
+    throw new Error(`DevOTA manifest must define a non-empty apps list: ${manifestPath}`);
+  }
+  const roots = new Map([["default", repoRoot]]);
+  const rawRoots = data.roots || {};
+  if (Array.isArray(rawRoots)) {
+    for (const [index, root] of rawRoots.entries()) {
+      const id = String(root?.id || "").trim();
+      const value = String(root?.path || "").trim();
+      if (!id || !value) throw new Error(`roots[${index}].id and path are required`);
+      roots.set(id, path.resolve(repoRoot, value));
+    }
+  } else if (rawRoots && typeof rawRoots === "object") {
+    for (const [rawId, spec] of Object.entries(rawRoots)) {
+      const id = String(rawId).trim();
+      const value = String(spec && typeof spec === "object" ? spec.path || "" : spec || "").trim();
+      if (!id || !value) throw new Error(`manifest root ${id || "<empty>"} must define a path`);
+      roots.set(id, path.resolve(repoRoot, value));
+    }
+  } else {
+    throw new Error("manifest roots must be a mapping or list");
+  }
+  const seen = new Set();
+  const apps = data.apps.map((app, index) => {
+    const id = String(app?.id || "").trim();
+    if (!id) throw new Error(`apps[${index}].id is required in ${manifestPath}`);
+    if (seen.has(id)) throw new Error(`duplicate app id in ${manifestPath}: ${id}`);
+    seen.add(id);
+    const buildDirs = Array.isArray(app.buildDirs) ? app.buildDirs : [];
+    if (buildDirs.length === 0) throw new Error(`${id}.buildDirs must be a non-empty list`);
+    const rootRef = String(app.root || app.repoRoot || "default").trim();
+    const appRoot = roots.get(rootRef) || path.resolve(repoRoot, rootRef);
+    return {
+      id,
+      label: String(app.label || id),
+      packageName: String(app.packageName || ""),
+      notes: String(app.notes || ""),
+      root: { id: rootRef, absolute: appRoot },
+      buildDirs: buildDirs.map((rel) => ({
+        relative: String(rel),
+        absolute: requireContainedPath(appRoot, path.resolve(appRoot, String(rel)), `${id}.buildDirs`),
+      })),
+      build: app.build || null,
+    };
+  });
+  return { version: data.version || 1, roots, apps };
+}
+
+function requireContainedPath(root, target, label) {
+  const relative = path.relative(root, target);
+  if (relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))) {
+    return target;
+  }
+  throw new Error(`${label} entry escapes its configured app root`);
+}
+
+async function resolveApp(appId) {
+  const manifest = await loadManifest();
+  if (!appId) return manifest.apps[0];
+  const app = manifest.apps.find((item) => item.id === appId);
+  if (!app) throw new Error(`unknown DevOTA app id: ${appId}`);
+  return app;
+}
+
+async function packageNameFor(appId, explicitPackageName) {
+  if (explicitPackageName && explicitPackageName.trim()) return explicitPackageName.trim();
+  const app = await resolveApp(appId);
+  return app.packageName || "";
+}
+
+async function walkApks(dir, app, out) {
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await walkApks(full, app, out);
+      continue;
+    }
+    if (!entry.isFile() || !entry.name.endsWith(".apk")) continue;
+    let resolved;
+    try {
+      resolved = await realpath(full);
+      requireContainedPath(app.root.absolute, resolved, `${app.id} APK`);
+    } catch {
+      continue;
+    }
+    const st = await stat(resolved);
+    const appRelativePath = path.relative(app.root.absolute, resolved).split(path.sep).join("/");
+    const relativePath = `apps/${app.id}/${appRelativePath}`;
+    out.push({
+      filename: entry.name,
+      size: st.size,
+      modifiedMs: st.mtimeMs,
+      modified: new Date(st.mtimeMs).toISOString(),
+      path: relativePath,
+      absolutePath: resolved,
+      appId: app.id,
+      appLabel: app.label,
+      packageName: app.packageName,
+      kind: app.id,
+    });
+  }
+}
+
+async function scanBuilds(appId) {
+  const manifest = await loadManifest();
+  const builds = [];
+  for (const app of manifest.apps) {
+    if (appId && app.id !== appId) continue;
+    for (const buildDir of app.buildDirs) {
+      await walkApks(buildDir.absolute, app, builds);
+    }
+  }
+  builds.sort((a, b) => b.modifiedMs - a.modifiedMs);
+  return builds;
+}
+
+async function latestBuild(appId) {
+  const builds = await scanBuilds(appId);
+  if (builds.length === 0) throw new Error(`no ${appId || "matching"} APK builds found`);
+  return builds[0];
+}
+
+function requireWholeDeviceTool(name) {
+  if (!wholeDeviceEnabled) {
+    throw new Error(`${name} requires DEVOTA_ENABLE_WHOLE_DEVICE=1 on the MCP server`);
+  }
+}
+
+function requireBuildCommandTool(name) {
+  if (!buildCommandsEnabled) {
+    throw new Error(`${name} requires DEVOTA_ENABLE_BUILD_COMMANDS=1 on the MCP server`);
+  }
+}
+
+function stamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+async function createRunDir(name) {
+  const dir = path.join(artifactRoot, "runs", `${stamp()}-${name}`);
+  await mkdir(dir, { recursive: true });
+  return dir;
+}
+
+async function writeJsonArtifact(file, value) {
+  await writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
+  return file;
+}
+
+function relArtifact(file) {
+  return path.relative(TOOL_ROOT, file).split(path.sep).join("/");
+}
+
+async function runExecFile(command, args, options = {}) {
+  const { cwd, timeout = 30000, maxBuffer = 32 * 1024 * 1024 } = options;
+  return await new Promise((resolve, reject) => {
+    execFile(command, args, { cwd, timeout, maxBuffer, encoding: "utf8" }, (error, stdout, stderr) => {
+      const result = { command, args, cwd, stdout, stderr, exitCode: error?.code ?? 0 };
+      if (error) {
+        const detail = stderr || stdout || error.message;
+        reject(Object.assign(new Error(`${command} ${args.join(" ")} failed: ${String(detail).trim()}`), { result }));
+        return;
+      }
+      resolve(result);
+    });
+  });
+}
+
+function commandRunner(commandText) {
+  if (process.platform === "win32") {
+    return { command: "powershell.exe", args: ["-NoProfile", "-Command", commandText] };
+  }
+  return { command: "bash", args: ["-lc", commandText] };
+}
+
+function buildCommandForApp(app, mode) {
+  const build = app.build;
+  if (!build) return null;
+  if (typeof build === "string") return { command: build, workingDir: "." };
+  const commands = build.commands || {};
+  const command = commands[mode] || build.command;
+  if (!command) return null;
+  return {
+    command: String(command),
+    workingDir: String(build.workingDir || "."),
+  };
+}
+
+async function runConfiguredBuild(appId, mode, runDir) {
+  requireBuildCommandTool("android_build_apk");
+  const app = await resolveApp(appId);
+  const configured = buildCommandForApp(app, mode);
+  if (!configured) {
+    throw new Error(`app ${app.id} does not define a build command in devota.yaml`);
+  }
+  const cwd = requireContainedPath(
+    app.root.absolute,
+    path.resolve(app.root.absolute, configured.workingDir),
+    `${app.id}.build.workingDir`,
+  );
+  const { command, args } = commandRunner(configured.command);
+
+  const startedAt = new Date().toISOString();
+  const result = await runExecFile(command, args, {
+    cwd,
+    timeout: 10 * 60 * 1000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  const finishedAt = new Date().toISOString();
+  await writeFile(path.join(runDir, "build.stdout.log"), result.stdout || "");
+  await writeFile(path.join(runDir, "build.stderr.log"), result.stderr || "");
+  const build = await latestBuild(app.id);
+  return {
+    appId: app.id,
+    appLabel: app.label,
+    mode,
+    startedAt,
+    finishedAt,
+    command: result.command,
+    args: result.args,
+    cwd: result.cwd,
+    output: {
+      stdoutLog: relArtifact(path.join(runDir, "build.stdout.log")),
+      stderrLog: relArtifact(path.join(runDir, "build.stderr.log")),
+    },
+    latestBuild: build,
+  };
+}
+
+async function installLatestApk(appId, mode, serial) {
+  const app = await resolveApp(appId);
+  const build = await latestBuild(app.id);
+  const selfUpdate = app.packageName === devotaPackage;
+  if (mode !== "phone") {
+    try {
+      const useSerial = await chooseAdbSerial(serial);
+      const out = await runAdb(["install", "-r", "-d", "-g", build.absolutePath], {
+        serial: useSerial,
+        timeout: 120000,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      return { mode: "adb", serial: useSerial, build, output: out.trim(), completed: true };
+    } catch (err) {
+      if (mode === "adb") throw err;
+    }
+  }
+  if (!buildServerUrl) {
+    throw new Error("DEVOTA_BUILD_SERVER_URL is required for phone-agent installs");
+  }
+  const result = await phone.command(
+    "installFromBuild",
+    {
+      buildServerUrl,
+      path: build.path,
+      filename: build.filename,
+    },
+    180000,
+  );
+  return {
+    mode: "phone",
+    app: publicApp(app),
+    build,
+    result,
+    completed: result.status !== "awaiting_user_confirmation",
+    selfUpdate,
+    manualConfirmationRequired: result.status === "awaiting_user_confirmation",
+    note: selfUpdate
+      ? "DevOTA self-updates can only download and open Android's package updater. Approve the update on the phone and restart the agent after Android replaces the app."
+      : "Phone-agent installs open Android's package updater. Accessibility automation may help with target-app prompts, but user approval can still be required by Android.",
+  };
+}
+
+async function captureScreenshot(runDir, label, serial) {
+  const file = path.join(runDir, `${label}.png`);
+  const captured = await captureScreenshotBuffer(serial);
+  await writeFile(file, captured.png);
+  try {
+    await chmod(file, 0o600);
+  } catch {
+    // Windows ACLs remain authoritative when chmod is unavailable.
+  }
+  if (captured.mode === "phone") {
+    const result = captured.result;
+    return { mode: "phone", artifact: file, relativeArtifact: relArtifact(file), ...result, pngBase64: undefined };
+  }
+  return {
+    mode: "adb",
+    serial: captured.serial,
+    artifact: file,
+    relativeArtifact: relArtifact(file),
+    bytes: captured.png.length,
+  };
+}
+
+async function captureScreenshotBuffer(serial) {
+  if (phone.summary().connected) {
+    const result = await phone.command("screenshot", {}, 45000);
+    return { mode: "phone", result, png: Buffer.from(result.pngBase64, "base64") };
+  }
+  const useSerial = await chooseAdbSerial(serial);
+  const png = await runAdb(["exec-out", "screencap", "-p"], {
+    serial: useSerial,
+    encoding: "buffer",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  return { mode: "adb", serial: useSerial, png };
+}
+
+async function captureTapTemplate({ x, y, bounds, serial }) {
+  if (!activeMacroRecording) return null;
+  const entryIndex = activeMacroRecording.entries.length + 1;
+  const directory = path.join(macroRecordingRoot, activeMacroRecording.id);
+  await mkdir(directory, { recursive: true });
+  const prefix = `entry-${String(entryIndex).padStart(4, "0")}`;
+  const screenshotPath = path.join(directory, `${prefix}-before.png`);
+  const templatePath = path.join(directory, `${prefix}-template.png`);
+  const captured = await captureScreenshotBuffer(serial);
+  await writeFile(screenshotPath, captured.png);
+  try {
+    await chmod(screenshotPath, 0o600);
+  } catch {
+    // Windows ACLs remain authoritative when chmod is unavailable.
+  }
+  const args = [
+    IMAGE_TEMPLATE_HELPER,
+    "--input",
+    screenshotPath,
+    "--output",
+    templatePath,
+    "--x",
+    String(Math.round(x)),
+    "--y",
+    String(Math.round(y)),
+  ];
+  if (validBounds(bounds)) {
+    args.push(
+      "--bounds",
+      String(Math.round(bounds.left)),
+      String(Math.round(bounds.top)),
+      String(Math.round(bounds.right)),
+      String(Math.round(bounds.bottom)),
+    );
+  }
+  const { stdout } = await execFileAsync("python3", args, {
+    timeout: 45000,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  const template = JSON.parse(stdout);
+  return {
+    template,
+    evidence: {
+      beforeScreenshot: relArtifact(screenshotPath),
+      template: relArtifact(templatePath),
+      captureMode: captured.mode,
+    },
+  };
+}
+
+async function getUiDump(serial) {
+  if (phone.summary().connected) {
+    return { mode: "phone", ...(await phone.command("uiDump", {})) };
+  }
+  const useSerial = await chooseAdbSerial(serial);
+  await runAdb(["shell", "uiautomator", "dump", "/sdcard/window.xml"], { serial: useSerial });
+  const xml = await runAdb(["exec-out", "cat", "/sdcard/window.xml"], {
+    serial: useSerial,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  return { mode: "adb", serial: useSerial, xml };
+}
+
+function nodeText(node) {
+  return [node.text, node.contentDescription, node.resourceId, node.className]
+    .filter((value) => value !== undefined && value !== null)
+    .join(" ");
+}
+
+function fieldMatches(actual, expected) {
+  if (expected === undefined || expected === null || expected === "") return true;
+  return String(actual || "").toLowerCase().includes(String(expected).toLowerCase());
+}
+
+function validBounds(bounds) {
+  return Boolean(bounds && bounds.right > bounds.left && bounds.bottom > bounds.top && bounds.right > 0 && bounds.bottom > 0);
+}
+
+function matchUiNode(node, selector) {
+  if (selector.visibleOnly !== false && !validBounds(node.bounds)) return false;
+  if (selector.checkable !== undefined && node.checkable !== selector.checkable) return false;
+  if (selector.checked !== undefined && node.checked !== selector.checked) return false;
+  return (
+    fieldMatches(node.text, selector.text) &&
+    fieldMatches(node.contentDescription, selector.contentDescription) &&
+    fieldMatches(node.resourceId, selector.resourceId) &&
+    fieldMatches(node.className, selector.className)
+  );
+}
+
+async function findUiNodes(selector, serial) {
+  const dump = await getUiDump(serial);
+  if (!Array.isArray(dump.nodes)) {
+    throw new Error("parsed phone-agent UI dump is required for UI selectors");
+  }
+  const matches = dump.nodes.filter((node) => matchUiNode(node, selector));
+  return { dump, matches };
+}
+
+function centerOfNode(node) {
+  if (!validBounds(node.bounds)) throw new Error("matched UI node has invalid bounds");
+  return {
+    x: Math.round((node.bounds.left + node.bounds.right) / 2),
+    y: Math.round((node.bounds.top + node.bounds.bottom) / 2),
+  };
+}
+
+async function tapNode(node, packageName, serial, recordingMetadata = {}) {
+  const { x, y } = centerOfNode(node);
+  const targetPackage = packageName || node.package || "";
+  return {
+    x,
+    y,
+    packageName: targetPackage,
+    result: await phoneOrAdb(
+      "tap",
+      { x, y, packageName: targetPackage },
+      async () => {
+        const useSerial = await chooseAdbSerial(serial);
+        await runAdb(["shell", "input", "tap", String(x), String(y)], { serial: useSerial });
+        return { mode: "adb", serial: useSerial, ok: true };
+      },
+      recordingMetadata,
+    ),
+  };
+}
+
+async function captureLogcat({ packageName, durationMs, clear, filter, serial, runDir }) {
+  const useSerial = await chooseAdbSerial(serial);
+  const duration = Math.min(60000, Math.max(1000, Math.round(durationMs)));
+  if (clear) await runAdb(["logcat", "-c"], { serial: useSerial, timeout: 15000 });
+  await new Promise((resolve) => setTimeout(resolve, duration));
+
+  let args = ["logcat", "-d", "-v", "time"];
+  let pid = null;
+  if (filter === "package" && packageName) {
+    try {
+      pid = String(await runAdb(["shell", "pidof", packageName], { serial: useSerial, timeout: 10000 })).trim().split(/\s+/)[0];
+      if (pid) args = ["logcat", "-d", "-v", "time", "--pid", pid];
+    } catch {
+      pid = null;
+    }
+  }
+
+  const raw = await runAdb(args, {
+    serial: useSerial,
+    timeout: 30000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  const text = filter === "package" && packageName && !pid
+    ? raw.split(/\r?\n/).filter((line) => line.includes(packageName)).join("\n")
+    : raw;
+  const file = path.join(runDir, "logcat.txt");
+  await writeFile(file, text);
+  return {
+    mode: "adb",
+    serial: useSerial,
+    packageName,
+    durationMs: duration,
+    filter,
+    pid,
+    artifact: file,
+    relativeArtifact: relArtifact(file),
+    bytes: Buffer.byteLength(text),
+    lines: text ? text.split(/\r?\n/).length : 0,
+  };
+}
+
+function adbStartIntentArgs({ packageName, action, uri, extras = {} }) {
+  const args = ["shell", "am", "start"];
+  const finalAction = action || (uri ? "android.intent.action.VIEW" : null);
+  if (finalAction) args.push("-a", finalAction);
+  if (uri) args.push("-d", uri);
+  if (packageName) args.push("-p", packageName);
+  for (const [key, value] of Object.entries(extras || {})) {
+    if (typeof value === "boolean") {
+      args.push("--ez", key, String(value));
+    } else if (Number.isInteger(value)) {
+      args.push("--ei", key, String(value));
+    } else if (typeof value === "number") {
+      args.push("--ef", key, String(value));
+    } else {
+      args.push("--es", key, String(value));
+    }
+  }
+  return args;
+}
+
+function summarizeNode(node) {
+  return {
+    package: node.package,
+    className: node.className,
+    text: node.text,
+    contentDescription: node.contentDescription,
+    resourceId: node.resourceId,
+    clickable: node.clickable,
+    checkable: node.checkable,
+    checked: node.checked,
+    enabled: node.enabled,
+    focused: node.focused,
+    bounds: node.bounds,
+  };
+}
+
+function permissionDecisionPatterns(decision) {
+  if (decision === "deny") return [/don.?t allow/i, /\bdeny\b/i];
+  if (decision === "only_this_time") return [/only this time/i];
+  if (decision === "while_in_use") return [/while using/i, /while the app/i];
+  return [/while using/i, /allow/i, /ok/i];
+}
+
+async function phoneOrAdb(action, args, adbFallback, recordingMetadata = {}) {
+  return await withRecordedPhoneAction(
+    action,
+    args,
+    async () => {
+      if (phone.summary().connected) return await phone.command(action, args);
+      if (adbFallback) return await adbFallback();
+      throw new Error("phone agent is not connected and no adb fallback is available");
+    },
+    recordingMetadata,
+  );
+}
+
+const server = new McpServer({
+  name: "devota-android-control",
+  version: "0.1.0",
+});
+
+server.registerTool(
+  "android_status",
+  {
+    title: "Android Control Status",
+    description: "Report phone-agent, relay, build-server, configured apps, and adb status.",
+  },
+  async () => {
+    let adb = { available: false, devices: [], error: null };
+    try {
+      adb.devices = await adbDevices();
+      adb.available = true;
+    } catch (err) {
+      adb.error = err.message;
+    }
+    return textResult({
+      relay: { port: wsPort, path: "/phone", wholeDeviceEnabled, buildCommandsEnabled },
+      phone: phone.summary(),
+      adb,
+      buildServerUrl,
+      repoRoot,
+      manifestPath,
+      apps: (await loadManifest()).apps.map(publicApp),
+    });
+  },
+);
+
+server.registerTool(
+  "android_probe_adb",
+  {
+    title: "Probe Network ADB",
+    description: "Try adb connect against a host:port reachable over your LAN or VPN.",
+    inputSchema: {
+      hostPort: z.string().optional().describe("ADB host:port. Defaults to DEVOTA_ADB_HOST."),
+    },
+  },
+  async ({ hostPort }) => {
+    const target = hostPort || env.DEVOTA_ADB_HOST;
+    if (!target) throw new Error("hostPort or DEVOTA_ADB_HOST is required");
+    const out = await runAdb(["connect", target], { timeout: 15000 });
+    return textResult({ target, output: out.trim(), devices: await adbDevices() });
+  },
+);
+
+server.registerTool(
+  "android_list_builds",
+  {
+    title: "List Android Builds",
+    description: "List APK builds known to DevOTA.",
+    inputSchema: {
+      appId: z.string().optional(),
+    },
+  },
+  async ({ appId }) => textResult(await scanBuilds(appId)),
+);
+
+server.registerTool(
+  "devota_macros_list",
+  {
+    title: "List DevOTA Macros",
+    description: "Return terminal and visible device-integration macros saved on the DevOTA build server.",
+  },
+  async () => textResult(await buildServerJson("/macros")),
+);
+
+server.registerTool(
+  "devota_macro_recording_start",
+  {
+    title: "Start DevOTA Macro Recording",
+    description: "Start a durable exploration log. Subsequent Android control actions are recorded as a prunable macro draft; failed attempts are retained in the log but excluded from the draft.",
+    inputSchema: {
+      name: z.string(),
+      priority: z.number().int().default(0),
+      redactTypedText: z.boolean().default(true),
+    },
+  },
+  async ({ name, priority, redactTypedText }) => {
+    if (activeMacroRecording) {
+      throw new Error(`macro recording already active: ${activeMacroRecording.id}`);
+    }
+    const id = `recording-${Date.now()}-${randomBytes(4).toString("hex")}`;
+    activeMacroRecording = {
+      format: "devota-macro-recording",
+      version: 1,
+      id,
+      name: name.trim() || "Recorded device workflow",
+      priority,
+      redactTypedText,
+      status: "recording",
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      entries: [],
+    };
+    const artifact = await persistMacroRecording(activeMacroRecording);
+    return textResult({ id, name: activeMacroRecording.name, priority, artifact });
+  },
+);
+
+server.registerTool(
+  "devota_macro_recording_status",
+  {
+    title: "DevOTA Macro Recording Status",
+    description: "Report the active exploration recording without exposing typed values or phone identifiers.",
+  },
+  async () => textResult(
+    activeMacroRecording
+      ? {
+          active: true,
+          id: activeMacroRecording.id,
+          name: activeMacroRecording.name,
+          entryCount: activeMacroRecording.entries.length,
+          startedAt: activeMacroRecording.startedAt,
+          updatedAt: activeMacroRecording.updatedAt,
+        }
+      : { active: false },
+  ),
+);
+
+server.registerTool(
+  "devota_macro_recording_stop",
+  {
+    title: "Stop And Compile DevOTA Macro Recording",
+    description: "Stop the active recording and compile a pruned draft. Failed attempts and observation-only actions are dropped; explicit entry indexes can also be omitted. Publication is refused while coordinate or input-placeholder review remains.",
+    inputSchema: {
+      omitEntryIndexes: z.array(z.number().int().positive()).default([]),
+      publish: z.boolean().default(false),
+      name: z.string().optional(),
+      priority: z.number().int().optional(),
+    },
+  },
+  async ({ omitEntryIndexes, publish, name, priority }) => {
+    if (!activeMacroRecording) throw new Error("no macro recording is active");
+    const recording = activeMacroRecording;
+    recording.status = "stopped";
+    recording.completedAt = new Date().toISOString();
+    recording.updatedAt = recording.completedAt;
+    await persistMacroRecording(recording);
+    activeMacroRecording = null;
+    return textResult(
+      await compileAndMaybePublishRecording(recording, {
+        omitEntryIndexes,
+        publish,
+        ...(name !== undefined ? { name } : {}),
+        ...(priority !== undefined ? { priority } : {}),
+      }),
+    );
+  },
+);
+
+server.registerTool(
+  "devota_macro_recording_compile",
+  {
+    title: "Recompile DevOTA Macro Recording",
+    description: "Recompile a saved exploration log after reviewing it, with optional entry pruning. Use publish only after the draft has no unresolved warnings.",
+    inputSchema: {
+      recordingId: z.string(),
+      omitEntryIndexes: z.array(z.number().int().positive()).default([]),
+      publish: z.boolean().default(false),
+      name: z.string().optional(),
+      priority: z.number().int().optional(),
+    },
+  },
+  async ({ recordingId, omitEntryIndexes, publish, name, priority }) => {
+    const recording = await loadMacroRecording(recordingId);
+    return textResult(
+      await compileAndMaybePublishRecording(recording, {
+        omitEntryIndexes,
+        publish,
+        ...(name !== undefined ? { name } : {}),
+        ...(priority !== undefined ? { priority } : {}),
+      }),
+    );
+  },
+);
+
+server.registerTool(
+  "devota_macros_create",
+  {
+    title: "Create DevOTA Macro",
+    description: "Create a DevOTA macro. A device step's value is JSON such as {\"action\":\"launchApp\",\"args\":{\"packageName\":\"...\"},\"expect\":{\"activePackage\":\"...\"},\"capture\":true}. Human-timed checks use humanCheckpoint. Read-only embedded-app API checks use localHttpAssert, which permits only loopback GET/HEAD requests.",
+    inputSchema: {
+      name: z.string(),
+      priority: z.number().int().default(0),
+      steps: z.array(macroStepSchema).min(1),
+    },
+  },
+  async ({ name, priority, steps }) => textResult(
+    await buildServerJson("/macros", {
+      method: "POST",
+      data: { name, priority, steps },
+    }),
+  ),
+);
+
+server.registerTool(
+  "devota_macros_update",
+  {
+    title: "Update DevOTA Macro",
+    description: "Update the name, priority, and/or terminal/device steps of an existing DevOTA macro.",
+    inputSchema: {
+      id: z.string(),
+      name: z.string().optional(),
+      priority: z.number().int().optional(),
+      steps: z.array(macroStepSchema).min(1).optional(),
+    },
+  },
+  async ({ id, name, priority, steps }) => {
+    const data = {};
+    if (name !== undefined) data.name = name;
+    if (priority !== undefined) data.priority = priority;
+    if (steps !== undefined) data.steps = steps;
+    return textResult(
+      await buildServerJson(`/macros/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        data,
+      }),
+    );
+  },
+);
+
+server.registerTool(
+  "devota_macro_runs_list",
+  {
+    title: "List DevOTA Macro Runs",
+    description: "List on-phone device macro runs and their evidence status from the DevOTA build server.",
+  },
+  async () => textResult(await buildServerJson("/macro-runs")),
+);
+
+server.registerTool(
+  "devota_macro_run_get",
+  {
+    title: "Get DevOTA Macro Run",
+    description: "Get a device macro run manifest including each step and screenshot filename.",
+    inputSchema: { runId: z.string() },
+  },
+  async ({ runId }) => textResult(
+    await buildServerJson(`/macro-runs/${encodeURIComponent(runId)}`),
+  ),
+);
+
+server.registerTool(
+  "devota_macro_run_collect",
+  {
+    title: "Collect DevOTA Macro Evidence",
+    description: "Download one zip containing the run manifest, per-step UI records, gallery, and all screenshots.",
+    inputSchema: { runId: z.string() },
+  },
+  async ({ runId }) => textResult({
+    runId,
+    ...(await downloadBuildServerArtifact(
+      `/macro-runs/${encodeURIComponent(runId)}/archive`,
+      `${runId}.zip`,
+    )),
+  }),
+);
+
+server.registerTool(
+  "devota_macros_delete",
+  {
+    title: "Delete DevOTA Macro",
+    description: "Delete a DevOTA terminal macro by id.",
+    inputSchema: {
+      id: z.string(),
+    },
+  },
+  async ({ id }) => textResult(
+    await buildServerJson(`/macros/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  ),
+);
+
+server.registerTool(
+  "devota_files_list",
+  {
+    title: "List DevOTA Transfer Files",
+    description: "List files staged for the phone in the DevOTA file-transfer directory, and report that directory's absolute path (where agents can drop files directly).",
+  },
+  async () => textResult(await buildServerJson("/files")),
+);
+
+server.registerTool(
+  "devota_files_send",
+  {
+    title: "Send File To Phone",
+    description: "Stage a file for the user to download in the DevOTA app's Files tab. Provide exactly one of: path (a local file on this machine), text (utf-8 content), or base64 (binary content). filename is required for text/base64 and optional for path.",
+    inputSchema: {
+      path: z.string().optional().describe("Local file path on the agent machine to read and send."),
+      text: z.string().optional().describe("UTF-8 text content to send. Requires filename."),
+      base64: z.string().optional().describe("Base64-encoded binary content to send. Requires filename."),
+      filename: z.string().optional().describe("Name to show on the phone. Defaults to the basename of path."),
+      contentType: z.string().optional().describe("Optional MIME type hint."),
+    },
+  },
+  async ({ path: localPath, text, base64, filename, contentType }) => {
+    const sources = [localPath, text, base64].filter((value) => value !== undefined && value !== null);
+    if (sources.length !== 1) {
+      throw new Error("provide exactly one of: path, text, base64");
+    }
+    let buffer;
+    let name = filename;
+    if (localPath !== undefined && localPath !== null) {
+      buffer = await readFile(localPath);
+      if (!name) name = path.basename(localPath);
+    } else if (text !== undefined && text !== null) {
+      if (!name) throw new Error("filename is required when sending text");
+      buffer = Buffer.from(text, "utf8");
+    } else {
+      if (!name) throw new Error("filename is required when sending base64");
+      buffer = Buffer.from(base64, "base64");
+    }
+    if (!name) throw new Error("could not determine a filename");
+    return textResult(
+      await buildServerUpload("/files/upload", { buffer, filename: name, contentType }),
+    );
+  },
+);
+
+server.registerTool(
+  "devota_files_delete",
+  {
+    title: "Delete DevOTA Transfer File",
+    description: "Delete a file from the DevOTA file-transfer directory by name.",
+    inputSchema: {
+      name: z.string(),
+    },
+  },
+  async ({ name }) => textResult(
+    await buildServerJson(`/files/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
+  ),
+);
+
+server.registerTool(
+  "devota_projects_board",
+  {
+    title: "Read DevOTA Project Board",
+    description: "Return clients, projects, phases, cards, comments, templates, and email configuration state from the DevOTA build server.",
+  },
+  async () => textResult(await buildServerJson("/projects/board")),
+);
+
+server.registerTool(
+  "devota_projects_create_client",
+  {
+    title: "Create DevOTA Client",
+    description: "Create a client record for the DevOTA Projects board.",
+    inputSchema: {
+      name: z.string(),
+      email: z.string().optional(),
+      notes: z.string().optional(),
+    },
+  },
+  async ({ name, email, notes }) => textResult(
+    await buildServerJson("/projects/clients", {
+      method: "POST",
+      data: { name, email, notes },
+    }),
+  ),
+);
+
+server.registerTool(
+  "devota_projects_create_project",
+  {
+    title: "Create DevOTA Project",
+    description: "Create a project. Pass clientId, or pass clientName/clientEmail to create the client first.",
+    inputSchema: {
+      clientId: z.number().optional(),
+      clientName: z.string().optional(),
+      clientEmail: z.string().optional(),
+      name: z.string(),
+      repoUrl: z.string().optional(),
+      buildAppId: z.string().optional(),
+      notes: z.string().optional(),
+      templateId: z.number().optional(),
+      applyTemplate: z.boolean().default(true),
+    },
+  },
+  async ({ clientId, clientName, clientEmail, name, repoUrl, buildAppId, notes, templateId, applyTemplate }) => {
+    let actualClientId = clientId;
+    let client = null;
+    if (!actualClientId) {
+      if (!clientName) throw new Error("clientId or clientName is required");
+      const created = await buildServerJson("/projects/clients", {
+        method: "POST",
+        data: { name: clientName, email: clientEmail || "" },
+      });
+      client = created.item;
+      actualClientId = client?.id;
+    }
+    const project = await buildServerJson("/projects/projects", {
+      method: "POST",
+      data: {
+        clientId: actualClientId,
+        name,
+        repoUrl,
+        buildAppId,
+        notes,
+        templateId,
+        applyTemplate,
+      },
+    });
+    return textResult({ status: "ok", client, project: project.item });
+  },
+);
+
+server.registerTool(
+  "devota_projects_create_template",
+  {
+    title: "Create DevOTA Phase Template",
+    description: "Create a reusable phase template for new projects.",
+    inputSchema: {
+      name: z.string(),
+      phases: z.array(z.string()).min(1),
+    },
+  },
+  async ({ name, phases }) => textResult(
+    await buildServerJson("/projects/templates", {
+      method: "POST",
+      data: { name, phases },
+    }),
+  ),
+);
+
+server.registerTool(
+  "devota_projects_create_card",
+  {
+    title: "Create DevOTA Card",
+    description: "Create a Kanban card under an existing phase.",
+    inputSchema: {
+      phaseId: z.number(),
+      title: z.string(),
+      body: z.string().optional(),
+      status: z.enum(["todo", "doing", "waiting_client", "review", "done"]).default("todo"),
+      clientActionRequired: z.boolean().default(false),
+    },
+  },
+  async ({ phaseId, title, body, status, clientActionRequired }) => textResult(
+    await buildServerJson("/projects/cards", {
+      method: "POST",
+      data: { phaseId, title, body, status, clientActionRequired },
+    }),
+  ),
+);
+
+server.registerTool(
+  "devota_projects_advance_card",
+  {
+    title: "Advance DevOTA Card",
+    description: "Move a card to a new status and optionally a new phase, with an optional comment.",
+    inputSchema: {
+      cardId: z.number(),
+      status: z.enum(["todo", "doing", "waiting_client", "review", "done"]),
+      phaseId: z.number().optional(),
+      clientActionRequired: z.boolean().optional(),
+      comment: z.string().optional(),
+    },
+  },
+  async ({ cardId, status, phaseId, clientActionRequired, comment }) => {
+    const data = { status };
+    if (phaseId !== undefined) data.phaseId = phaseId;
+    if (clientActionRequired !== undefined) data.clientActionRequired = clientActionRequired;
+    const updated = await buildServerJson(`/projects/cards/${cardId}`, {
+      method: "PATCH",
+      data,
+    });
+    let addedComment = null;
+    if (comment && comment.trim()) {
+      const result = await buildServerJson(`/projects/cards/${cardId}/comments`, {
+        method: "POST",
+        data: { authorType: "me", body: comment.trim(), source: "mcp" },
+      });
+      addedComment = result.item;
+    }
+    return textResult({ status: "ok", card: updated.item, comment: addedComment });
+  },
+);
+
+server.registerTool(
+  "devota_projects_add_comment",
+  {
+    title: "Add DevOTA Card Comment",
+    description: "Append a comment to a DevOTA card thread.",
+    inputSchema: {
+      cardId: z.number(),
+      body: z.string(),
+      authorType: z.enum(["me", "client", "system"]).default("me"),
+    },
+  },
+  async ({ cardId, body, authorType }) => textResult(
+    await buildServerJson(`/projects/cards/${cardId}/comments`, {
+      method: "POST",
+      data: { body, authorType, source: "mcp" },
+    }),
+  ),
+);
+
+server.registerTool(
+  "devota_projects_send_card_email",
+  {
+    title: "Send DevOTA Card Email",
+    description: "Preview or send a Postmark email tied to a card thread.",
+    inputSchema: {
+      cardId: z.number(),
+      event: z.enum(["update", "phase_started", "phase_completed", "client_action"]).default("update"),
+      subject: z.string().optional(),
+      message: z.string().optional(),
+      previewOnly: z.boolean().default(false),
+    },
+  },
+  async ({ cardId, event, subject, message, previewOnly }) => {
+    const path = previewOnly
+      ? `/projects/cards/${cardId}/email/preview`
+      : `/projects/cards/${cardId}/email/send`;
+    return textResult(
+      await buildServerJson(path, {
+        method: "POST",
+        data: { event, subject, message },
+      }),
+    );
+  },
+);
+
+server.registerTool(
+  "devota_projects_pull_replies",
+  {
+    title: "Pull DevOTA Email Replies",
+    description: "Pull inbound reply events from the configured public relay into DevOTA card comments.",
+  },
+  async () => textResult(
+    await buildServerJson("/projects/mail/pull", {
+      method: "POST",
+      data: {},
+    }),
+  ),
+);
+
+server.registerTool(
+  "android_build_apk",
+  {
+    title: "Build Android APK",
+    description: "Run the selected app's optional manifest build command. Requires DEVOTA_ENABLE_BUILD_COMMANDS=1.",
+    inputSchema: {
+      appId: z.string().optional(),
+      mode: z.enum(["debug", "release"]).default("debug"),
+    },
+  },
+  async ({ appId, mode }) => {
+    const app = await resolveApp(appId);
+    const runDir = await createRunDir(`build-${app.id}-${mode}`);
+    const result = await runConfiguredBuild(app.id, mode, runDir);
+    const manifest = { tool: "android_build_apk", runDir, relativeRunDir: relArtifact(runDir), result };
+    await writeJsonArtifact(path.join(runDir, "manifest.json"), manifest);
+    return textResult(manifest);
+  },
+);
+
+server.registerTool(
+  "android_install_latest",
+  {
+    title: "Install Latest APK",
+    description: "Install the selected app's latest APK using adb when available, otherwise ask the phone agent to download and open Android's installer. DevOTA self-updates are manual confirmation only.",
+    inputSchema: {
+      appId: z.string().optional(),
+      mode: z.enum(["auto", "adb", "phone"]).default("auto"),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ appId, mode, serial }) => {
+    return textResult(await installLatestApk(appId, mode, serial));
+  },
+);
+
+server.registerTool(
+  "android_rebuild_install_launch",
+  {
+    title: "Rebuild Install Launch",
+    description: "Run an optional manifest build command, install the latest APK, launch the app, and collect debug artifacts. Requires DEVOTA_ENABLE_BUILD_COMMANDS=1.",
+    inputSchema: {
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      buildMode: z.enum(["debug", "release"]).default("debug"),
+      installMode: z.enum(["auto", "adb", "phone"]).default("auto"),
+      captureLogs: z.boolean().default(false),
+      screenshot: z.boolean().default(true),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ appId, packageName, buildMode, installMode, captureLogs, screenshot, serial }) => {
+    const app = await resolveApp(appId);
+    const targetPackage = await packageNameFor(app.id, packageName);
+    const runDir = await createRunDir(`rebuild-install-launch-${app.id}`);
+    const manifest = {
+      tool: "android_rebuild_install_launch",
+      runDir,
+      relativeRunDir: relArtifact(runDir),
+      inputs: { appId: app.id, packageName: targetPackage, buildMode, installMode, captureLogs, screenshot },
+      steps: {},
+      completed: false,
+    };
+
+    try {
+      manifest.steps.build = await runConfiguredBuild(app.id, buildMode, runDir);
+      manifest.steps.install = await installLatestApk(app.id, installMode, serial);
+      if (manifest.steps.install.completed) {
+        manifest.steps.launch = await phoneOrAdb("launchApp", { packageName: targetPackage }, async () => {
+          const useSerial = await chooseAdbSerial(serial);
+          const out = await runAdb(
+            ["shell", "monkey", "-p", targetPackage, "-c", "android.intent.category.LAUNCHER", "1"],
+            { serial: useSerial },
+          );
+          return { mode: "adb", serial: useSerial, output: out.trim() };
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        if (screenshot) manifest.steps.screenshot = await captureScreenshot(runDir, "launch", serial);
+        manifest.steps.uiDump = await getUiDump(serial);
+        await writeJsonArtifact(path.join(runDir, "ui-dump.json"), manifest.steps.uiDump);
+        if (captureLogs) {
+          try {
+            manifest.steps.logcat = await captureLogcat({
+              packageName: targetPackage,
+              durationMs: 5000,
+              clear: false,
+              filter: "package",
+              serial,
+              runDir,
+            });
+          } catch (err) {
+            manifest.steps.logcat = { ok: false, error: err.message };
+          }
+        }
+        manifest.completed = true;
+      } else {
+        manifest.awaitingUserConfirmation = true;
+      }
+    } catch (err) {
+      manifest.error = err.message;
+      await writeJsonArtifact(path.join(runDir, "manifest.json"), manifest);
+      throw err;
+    }
+    await writeJsonArtifact(path.join(runDir, "manifest.json"), manifest);
+    return textResult(manifest);
+  },
+);
+
+server.registerTool(
+  "android_launch_app",
+  {
+    title: "Launch Android App",
+    description: "Launch a package on the phone. Defaults to the selected manifest app package.",
+    inputSchema: {
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ appId, packageName, serial }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    if (!targetPackage) throw new Error("packageName or manifest app packageName is required");
+    return textResult(
+      await phoneOrAdb("launchApp", { packageName: targetPackage }, async () => {
+        const useSerial = await chooseAdbSerial(serial);
+        const out = await runAdb(
+          ["shell", "monkey", "-p", targetPackage, "-c", "android.intent.category.LAUNCHER", "1"],
+          { serial: useSerial },
+        );
+        return { mode: "adb", serial: useSerial, output: out.trim() };
+      }),
+    );
+  },
+);
+
+server.registerTool(
+  "android_launch_intent",
+  {
+    title: "Launch Android Intent",
+    description: "Launch a package-scoped Android intent or deep link.",
+    inputSchema: {
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      action: z.string().optional(),
+      uri: z.string().optional(),
+      extras: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ appId, packageName, action, uri, extras, serial }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    return textResult(
+      await phoneOrAdb("launchIntent", { packageName: targetPackage, action, uri, extras: extras || {} }, async () => {
+        const useSerial = await chooseAdbSerial(serial);
+        if (!action && !uri && targetPackage) {
+          const out = await runAdb(
+            ["shell", "monkey", "-p", targetPackage, "-c", "android.intent.category.LAUNCHER", "1"],
+            { serial: useSerial },
+          );
+          return { mode: "adb", serial: useSerial, output: out.trim() };
+        }
+        const out = await runAdb(adbStartIntentArgs({ packageName: targetPackage, action, uri, extras }), {
+          serial: useSerial,
+          timeout: 30000,
+        });
+        return { mode: "adb", serial: useSerial, output: out.trim() };
+      }),
+    );
+  },
+);
+
+server.registerTool(
+  "android_screenshot",
+  {
+    title: "Android Screenshot",
+    description: "Capture a PNG screenshot through the phone agent or adb fallback.",
+    inputSchema: {
+      serial: z.string().optional(),
+    },
+  },
+  async ({ serial }) => {
+    await mkdir(artifactRoot, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const file = path.join(artifactRoot, `screenshot-${stamp}.png`);
+    if (phone.summary().connected) {
+      const result = await phone.command("screenshot", {}, 45000);
+      await writeFile(file, Buffer.from(result.pngBase64, "base64"));
+      return imageResult(result.pngBase64, { mode: "phone", artifact: file, ...result, pngBase64: undefined });
+    }
+    const useSerial = await chooseAdbSerial(serial);
+    const png = await runAdb(["exec-out", "screencap", "-p"], {
+      serial: useSerial,
+      encoding: "buffer",
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    await writeFile(file, png);
+    return imageResult(png.toString("base64"), { mode: "adb", serial: useSerial, artifact: file, bytes: png.length });
+  },
+);
+
+server.registerTool(
+  "android_ui_dump",
+  {
+    title: "Android UI Dump",
+    description: "Return current UI hierarchy. Phone-agent mode returns parsed nodes; adb fallback returns raw UIAutomator XML.",
+    inputSchema: {
+      serial: z.string().optional(),
+    },
+  },
+  async ({ serial }) => textResult(await getUiDump(serial)),
+);
+
+server.registerTool(
+  "android_logcat_capture",
+  {
+    title: "Capture Android Logcat",
+    description: "Capture logcat through ADB. This tool requires an ADB device; the phone agent cannot read app logs.",
+    inputSchema: {
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      durationMs: z.number().default(10000),
+      clear: z.boolean().default(false),
+      filter: z.enum(["package", "none"]).default("package"),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ appId, packageName, durationMs, clear, filter, serial }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    const runDir = await createRunDir(`logcat-${(targetPackage || "android").replace(/[^a-zA-Z0-9_.-]/g, "_")}`);
+    const result = await captureLogcat({ packageName: targetPackage, durationMs, clear, filter, serial, runDir });
+    const manifest = { tool: "android_logcat_capture", runDir, relativeRunDir: relArtifact(runDir), result };
+    await writeJsonArtifact(path.join(runDir, "manifest.json"), manifest);
+    return textResult(manifest);
+  },
+);
+
+server.registerTool(
+  "android_collect_state",
+  {
+    title: "Collect Android State",
+    description: "Collect status, screenshot, UI dump, and optional logcat into a run artifact directory.",
+    inputSchema: {
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      includeLogs: z.boolean().default(false),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ appId, packageName, includeLogs, serial }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    const runDir = await createRunDir(`state-${(targetPackage || "android").replace(/[^a-zA-Z0-9_.-]/g, "_")}`);
+    const status = {
+      relay: { port: wsPort, path: "/phone", wholeDeviceEnabled, buildCommandsEnabled },
+      phone: phone.summary(),
+      buildServerUrl,
+    };
+    const screenshot = await captureScreenshot(runDir, "state", serial);
+    const uiDump = await getUiDump(serial);
+    await writeJsonArtifact(path.join(runDir, "ui-dump.json"), uiDump);
+    const manifest = {
+      tool: "android_collect_state",
+      runDir,
+      relativeRunDir: relArtifact(runDir),
+      packageName: targetPackage,
+      status,
+      screenshot,
+      uiDump: {
+        mode: uiDump.mode,
+        activePackage: uiDump.activePackage,
+        nodeCount: uiDump.nodeCount,
+        truncated: uiDump.truncated,
+        artifact: relArtifact(path.join(runDir, "ui-dump.json")),
+      },
+    };
+    if (includeLogs) {
+      try {
+        manifest.logcat = await captureLogcat({ packageName: targetPackage, durationMs: 5000, clear: false, filter: "package", serial, runDir });
+      } catch (err) {
+        manifest.logcat = { ok: false, error: err.message };
+      }
+    }
+    await writeJsonArtifact(path.join(runDir, "manifest.json"), manifest);
+    return textResult(manifest);
+  },
+);
+
+server.registerTool(
+  "android_tap",
+  {
+    title: "Tap Android Screen",
+    description: "Tap screen coordinates.",
+    inputSchema: {
+      x: z.number(),
+      y: z.number(),
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ x, y, appId, packageName, serial }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    let recordedTemplate = null;
+    try {
+      recordedTemplate = await captureTapTemplate({ x, y, serial });
+    } catch (error) {
+      console.error(`[devota_mcp] tap template capture failed: ${error.message}`);
+    }
+    const macroMetadata = recordedTemplate
+      ? {
+          macroAction: "tapImage",
+          macroArgs: {
+            template: recordedTemplate.template,
+            ...(targetPackage ? { packageName: targetPackage } : {}),
+          },
+          imageTemplateEvidence: recordedTemplate.evidence,
+          label: "Tap recorded image",
+        }
+      : {};
+    return textResult(
+      await phoneOrAdb("tap", { x, y, packageName: targetPackage }, async () => {
+        const useSerial = await chooseAdbSerial(serial);
+        await runAdb(["shell", "input", "tap", String(Math.round(x)), String(Math.round(y))], { serial: useSerial });
+        return { mode: "adb", serial: useSerial, ok: true };
+      }, macroMetadata),
+    );
+  },
+);
+
+server.registerTool(
+  "android_tap_image",
+  {
+    title: "Tap Android Image Template",
+    description: "Find a bounded recorded PNG template locally on the phone, recalibrate its location, and tap only above the declared confidence threshold.",
+    inputSchema: {
+      template: imageTemplateSchema,
+      durationMs: z.number().min(80).max(5000).default(80),
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+    },
+  },
+  async ({ template, durationMs, appId, packageName }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    return textResult(
+      await phoneOrAdb(
+        "tapImage",
+        { template, durationMs, ...(targetPackage ? { packageName: targetPackage } : {}) },
+        null,
+        { label: "Tap matched image" },
+      ),
+    );
+  },
+);
+
+server.registerTool(
+  "android_find_ui",
+  {
+    title: "Find Android UI Nodes",
+    description: "Find nodes in the current parsed accessibility UI dump.",
+    inputSchema: {
+      text: z.string().optional(),
+      contentDescription: z.string().optional(),
+      resourceId: z.string().optional(),
+      className: z.string().optional(),
+      visibleOnly: z.boolean().default(true),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ serial, ...selector }) => {
+    const { dump, matches } = await findUiNodes(selector, serial);
+    return textResult({
+      activePackage: dump.activePackage,
+      nodeCount: dump.nodeCount,
+      matchCount: matches.length,
+      matches: matches.map(summarizeNode),
+    });
+  },
+);
+
+server.registerTool(
+  "android_tap_ui",
+  {
+    title: "Tap Android UI Node",
+    description: "Find exactly one UI node by selector and tap its center.",
+    inputSchema: {
+      selector: uiSelectorSchema,
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ selector, appId, packageName, serial }) => {
+    const { dump, matches } = await findUiNodes(selector, serial);
+    if (matches.length !== 1) {
+      throw new Error(`android_tap_ui expected exactly one match, found ${matches.length}`);
+    }
+    const targetPackage = await packageNameFor(appId, packageName);
+    const center = centerOfNode(matches[0]);
+    let recordedTemplate = null;
+    try {
+      recordedTemplate = await captureTapTemplate({
+        x: center.x,
+        y: center.y,
+        bounds: matches[0].bounds,
+        serial,
+      });
+    } catch (error) {
+      console.error(`[devota_mcp] UI tap template capture failed: ${error.message}`);
+    }
+    const tap = await tapNode(matches[0], targetPackage, serial, {
+      macroAction: "tapUi",
+      macroArgs: {
+        selector,
+        ...(recordedTemplate ? { imageFallback: recordedTemplate.template } : {}),
+        ...(targetPackage ? { packageName: targetPackage } : {}),
+      },
+      ...(recordedTemplate ? { imageTemplateEvidence: recordedTemplate.evidence } : {}),
+      label: `Tap ${selector.text || selector.contentDescription || selector.resourceId || "UI control"}`,
+    });
+    return textResult({ activePackage: dump.activePackage, match: summarizeNode(matches[0]), tap });
+  },
+);
+
+server.registerTool(
+  "android_gesture_ui",
+  {
+    title: "Gesture From Android UI Node",
+    description: "Resolve one semantic node on the device and dispatch a native gesture from its current center. Swipe/path offsets are physical screen pixels; path time is one total duration.",
+    inputSchema: {
+      selector: uiSelectorSchema,
+      gesture: gestureUiSpecSchema,
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+    },
+  },
+  async ({ selector, gesture, appId, packageName }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    const args = { selector, gesture, packageName: targetPackage };
+    return textResult(await phoneOrAdb("gestureUi", args, async () => {
+      throw new Error("gestureUi requires a connected DevOTA agent with native gesture support");
+    }, { macroAction: "gestureUi", macroArgs: args }));
+  },
+);
+
+server.registerTool(
+  "android_assert_ui",
+  {
+    title: "Assert Android UI",
+    description: "Assert text presence/absence from the current UI dump and save evidence artifacts.",
+    inputSchema: {
+      mustContainText: z.array(z.string()).default([]),
+      mustNotContainText: z.array(z.string()).default([]),
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ mustContainText, mustNotContainText, appId, packageName, serial }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    const runDir = await createRunDir("assert-ui");
+    const screenshot = await captureScreenshot(runDir, "assert", serial);
+    const uiDump = await getUiDump(serial);
+    await writeJsonArtifact(path.join(runDir, "ui-dump.json"), uiDump);
+    const haystack = Array.isArray(uiDump.nodes) ? uiDump.nodes.map(nodeText).join("\n").toLowerCase() : String(uiDump.xml || "").toLowerCase();
+    const failures = [];
+    for (const text of mustContainText) {
+      if (!haystack.includes(text.toLowerCase())) failures.push(`missing expected text: ${text}`);
+    }
+    for (const text of mustNotContainText) {
+      if (haystack.includes(text.toLowerCase())) failures.push(`found forbidden text: ${text}`);
+    }
+    if (targetPackage && uiDump.activePackage && uiDump.activePackage !== targetPackage) {
+      failures.push(`active package ${uiDump.activePackage} did not match ${targetPackage}`);
+    }
+    const manifest = {
+      tool: "android_assert_ui",
+      runDir,
+      relativeRunDir: relArtifact(runDir),
+      pass: failures.length === 0,
+      failures,
+      screenshot,
+      uiDump: {
+        mode: uiDump.mode,
+        activePackage: uiDump.activePackage,
+        nodeCount: uiDump.nodeCount,
+        artifact: relArtifact(path.join(runDir, "ui-dump.json")),
+      },
+    };
+    await writeJsonArtifact(path.join(runDir, "manifest.json"), manifest);
+    return textResult(manifest);
+  },
+);
+
+server.registerTool(
+  "android_handle_permission_dialog",
+  {
+    title: "Handle Android Permission Dialog",
+    description: "Tap a common Android permission-dialog decision button found in the current UI dump.",
+    inputSchema: {
+      decision: z.enum(["allow", "deny", "while_in_use", "only_this_time"]).default("allow"),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ decision, serial }) => {
+    const dump = await getUiDump(serial);
+    if (!Array.isArray(dump.nodes)) throw new Error("parsed phone-agent UI dump is required for permission handling");
+    const patterns = permissionDecisionPatterns(decision);
+    const matches = dump.nodes.filter((node) =>
+      validBounds(node.bounds) && patterns.some((pattern) => pattern.test(String(node.text || node.contentDescription || ""))),
+    );
+    if (matches.length === 0) throw new Error(`no permission dialog button matched decision: ${decision}`);
+    const matchedText = String(matches[0].text || matches[0].contentDescription || "");
+    const tap = await tapNode(matches[0], undefined, serial, {
+      macroAction: "tapUi",
+      macroArgs: { selector: { text: matchedText, visibleOnly: true } },
+      label: `Permission: ${decision}`,
+    });
+    return textResult({ decision, activePackage: dump.activePackage, match: summarizeNode(matches[0]), tap });
+  },
+);
+
+server.registerTool(
+  "android_double_tap",
+  {
+    title: "Double Tap Android Screen",
+    description: "Dispatch two native accessibility taps at one screen point.",
+    inputSchema: {
+      x: z.number(), y: z.number(),
+      appId: z.string().optional(), packageName: z.string().optional(),
+    },
+  },
+  async ({ x, y, appId, packageName }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    return textResult(await phoneOrAdb("doubleTap", { x, y, packageName: targetPackage }, async () => {
+      throw new Error("doubleTap requires a connected DevOTA agent with native gesture support");
+    }, { macroAction: "doubleTap", macroArgs: { x, y, packageName: targetPackage } }));
+  },
+);
+
+server.registerTool(
+  "android_gesture_path",
+  {
+    title: "Draw Android Gesture Path",
+    description: "Dispatch one continuous native accessibility stroke through screen points over one total duration. Android spaces time along path length.",
+    inputSchema: {
+      points: z.array(z.object({ x: z.number(), y: z.number() }).strict()).min(2).max(64),
+      durationMs: z.number().int().min(80).max(5000),
+      appId: z.string().optional(), packageName: z.string().optional(),
+    },
+  },
+  async ({ points, durationMs, appId, packageName }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    return textResult(await phoneOrAdb("gesturePath", { points, durationMs, packageName: targetPackage }, async () => {
+      throw new Error("gesturePath requires a connected DevOTA agent with native gesture support");
+    }, { macroAction: "gesturePath", macroArgs: { points, durationMs, packageName: targetPackage } }));
+  },
+);
+
+server.registerTool(
+  "android_swipe",
+  {
+    title: "Swipe Android Screen",
+    description: "Swipe between screen coordinates.",
+    inputSchema: {
+      x1: z.number(),
+      y1: z.number(),
+      x2: z.number(),
+      y2: z.number(),
+      durationMs: z.number().default(300),
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ x1, y1, x2, y2, durationMs, appId, packageName, serial }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    return textResult(
+      await phoneOrAdb("swipe", { x1, y1, x2, y2, durationMs, packageName: targetPackage }, async () => {
+        const useSerial = await chooseAdbSerial(serial);
+        await runAdb(
+          ["shell", "input", "swipe", String(x1), String(y1), String(x2), String(y2), String(durationMs)],
+          { serial: useSerial },
+        );
+        return { mode: "adb", serial: useSerial, ok: true };
+      }),
+    );
+  },
+);
+
+server.registerTool(
+  "android_long_tap",
+  {
+    title: "Long Tap Android Screen",
+    description: "Long-press screen coordinates.",
+    inputSchema: {
+      x: z.number(),
+      y: z.number(),
+      durationMs: z.number().default(750),
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ x, y, durationMs, appId, packageName, serial }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    let recordedTemplate = null;
+    try {
+      recordedTemplate = await captureTapTemplate({ x, y, serial });
+    } catch (error) {
+      console.error(`[devota_mcp] long-tap template capture failed: ${error.message}`);
+    }
+    const macroMetadata = recordedTemplate
+      ? {
+          macroAction: "tapImage",
+          macroArgs: {
+            template: recordedTemplate.template,
+            durationMs,
+            ...(targetPackage ? { packageName: targetPackage } : {}),
+          },
+          imageTemplateEvidence: recordedTemplate.evidence,
+          label: "Long-press recorded image",
+        }
+      : {};
+    return textResult(
+      await phoneOrAdb("longTap", { x, y, durationMs, packageName: targetPackage }, async () => {
+        const useSerial = await chooseAdbSerial(serial);
+        await runAdb(
+          [
+            "shell",
+            "input",
+            "swipe",
+            String(Math.round(x)),
+            String(Math.round(y)),
+            String(Math.round(x)),
+            String(Math.round(y)),
+            String(Math.min(5000, Math.max(500, Math.round(durationMs)))),
+          ],
+          { serial: useSerial },
+        );
+        return { mode: "adb", serial: useSerial, ok: true };
+      }, macroMetadata),
+    );
+  },
+);
+
+server.registerTool(
+  "android_type_text",
+  {
+    title: "Type Android Text",
+    description: "Set focused text field content through the phone agent; adb fallback is ASCII-oriented.",
+    inputSchema: {
+      text: z.string(),
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ text, appId, packageName, serial }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    return textResult(
+      await phoneOrAdb("typeText", { text, packageName: targetPackage }, async () => {
+        const useSerial = await chooseAdbSerial(serial);
+        const escaped = text.replace(/%/g, "%25").replace(/\s/g, "%s");
+        await runAdb(["shell", "input", "text", escaped], { serial: useSerial });
+        return { mode: "adb", serial: useSerial, ok: true };
+      }),
+    );
+  },
+);
+
+server.registerTool(
+  "android_back",
+  {
+    title: "Android Back",
+    description: "Press Android back.",
+    inputSchema: {
+      appId: z.string().optional(),
+      packageName: z.string().optional(),
+      serial: z.string().optional(),
+    },
+  },
+  async ({ appId, packageName, serial }) => {
+    const targetPackage = await packageNameFor(appId, packageName);
+    return textResult(
+      await phoneOrAdb("back", { packageName: targetPackage }, async () => {
+        const useSerial = await chooseAdbSerial(serial);
+        await runAdb(["shell", "input", "keyevent", "BACK"], { serial: useSerial });
+        return { mode: "adb", serial: useSerial, ok: true };
+      }),
+    );
+  },
+);
+
+server.registerTool(
+  "android_open_uri",
+  {
+    title: "Open URI On Android",
+    description: "Open a URI. Requires whole-device enablement unless handled by app scope.",
+    inputSchema: {
+      uri: z.string(),
+    },
+  },
+  async ({ uri }) => {
+    requireWholeDeviceTool("android_open_uri");
+    return textResult(await phoneOrAdb("openUri", { uri }));
+  },
+);
+
+server.registerTool(
+  "android_home",
+  {
+    title: "Android Home",
+    description: "Press Android home. Requires whole-device enablement.",
+  },
+  async () => {
+    requireWholeDeviceTool("android_home");
+    return textResult(await phoneOrAdb("home", {}));
+  },
+);
+
+server.registerTool(
+  "android_recents",
+  {
+    title: "Android Recents",
+    description: "Open Android recents. Requires whole-device enablement.",
+  },
+  async () => {
+    requireWholeDeviceTool("android_recents");
+    return textResult(await phoneOrAdb("recents", {}));
+  },
+);
+
+server.registerTool(
+  "android_open_settings",
+  {
+    title: "Open Android Settings",
+    description: "Open Android settings. Requires whole-device enablement.",
+  },
+  async () => {
+    requireWholeDeviceTool("android_open_settings");
+    return textResult(await phoneOrAdb("openSettings", {}));
+  },
+);
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
