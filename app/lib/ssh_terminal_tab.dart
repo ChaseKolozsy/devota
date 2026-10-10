@@ -3548,6 +3548,9 @@ class _SshTerminalTabState extends State<SshTerminalTab>
   }
 
   Widget _buildTerminalToolsHeader(ThemeData theme) {
+    final collapsedKeys = _terminalToolsVisible
+        ? const <TerminalPadKey>[]
+        : _collapsedBarKeys();
     return Material(
       color: theme.colorScheme.surfaceContainer,
       child: InkWell(
@@ -3572,18 +3575,21 @@ class _SshTerminalTabState extends State<SshTerminalTab>
                   ),
                 ),
                 const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    _terminalToolsVisible
-                        ? 'Terminal, tmux, macros, commands'
-                        : 'Tap to show terminal controls',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.labelSmall?.copyWith(
-                      color: theme.colorScheme.onSurfaceVariant,
+                if (collapsedKeys.isEmpty)
+                  Expanded(
+                    child: Text(
+                      _terminalToolsVisible
+                          ? 'Terminal, tmux, macros, commands'
+                          : 'Tap to show terminal controls',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
                     ),
-                  ),
-                ),
+                  )
+                else
+                  Expanded(child: _buildCollapsedBarKeys(collapsedKeys)),
                 if (_tmuxScrollMode)
                   TextButton(
                     style: TextButton.styleFrom(
@@ -3594,7 +3600,7 @@ class _SshTerminalTabState extends State<SshTerminalTab>
                     onPressed: _exitTmuxScrollMode,
                     child: const Text('Exit scroll'),
                   ),
-                if (_terminalToolsVisible)
+                if (_terminalToolsVisible || collapsedKeys.isNotEmpty)
                   IconButton(
                     icon: const Icon(Icons.tune, size: 20),
                     visualDensity: VisualDensity.compact,
@@ -3608,6 +3614,37 @@ class _SshTerminalTabState extends State<SshTerminalTab>
       ),
     );
   }
+
+  List<TerminalPadKey> _collapsedBarKeys() => [
+    for (final id in _padConfig.collapsedIds) ?_padKeyById(id),
+  ];
+
+  /// The collapsed bar's own buttons, right-aligned; the space left of them
+  /// still opens the tools. A window two buttons wide; any more scroll
+  /// sideways, like the pad rows.
+  Widget _buildCollapsedBarKeys(List<TerminalPadKey> keys) {
+    final visible = keys.length < _collapsedBarVisibleKeys
+        ? keys.length
+        : _collapsedBarVisibleKeys;
+    return Align(
+      alignment: Alignment.centerRight,
+      child: SizedBox(
+        width: visible * _padFixedKeyWidth + (visible - 1) * 4,
+        height: 30,
+        child: ListView.separated(
+          key: const ValueKey('collapsed-tools-keys'),
+          scrollDirection: Axis.horizontal,
+          padding: EdgeInsets.zero,
+          physics: const ClampingScrollPhysics(),
+          itemCount: keys.length,
+          separatorBuilder: (_, _) => const SizedBox(width: 4),
+          itemBuilder: (_, index) => _buildPadFixedRightButton(keys[index]),
+        ),
+      ),
+    );
+  }
+
+  static const _collapsedBarVisibleKeys = 2;
 
   Widget _buildTerminalControlPad(ThemeData theme) {
     return Material(
@@ -4073,6 +4110,7 @@ class _SshTerminalTabState extends State<SshTerminalTab>
 
   void _deleteCustomKey(String id) {
     _padUnplaceKey(id);
+    _padConfig.collapsedIds.remove(id);
     _padConfig.customKeys.removeWhere((k) => k.id == id);
   }
 
@@ -4128,6 +4166,8 @@ class _SshTerminalTabState extends State<SshTerminalTab>
                     _buildPadRowSettings(theme, 0, 'Top row', applyConfig),
                     const Divider(height: 28),
                     _buildPadRowSettings(theme, 1, 'Bottom row', applyConfig),
+                    const Divider(height: 28),
+                    _buildCollapsedBarSettings(theme, applyConfig),
                     const Divider(height: 28),
                     Align(
                       alignment: Alignment.centerLeft,
@@ -4208,6 +4248,126 @@ class _SshTerminalTabState extends State<SshTerminalTab>
           alignment: Alignment.centerLeft,
           child: _buildAddKeyControl(theme, rowIndex, applyConfig),
         ),
+      ],
+    );
+  }
+
+  Widget _buildCollapsedBarSettings(
+    ThemeData theme,
+    void Function(void Function()) applyConfig,
+  ) {
+    final ids = _padConfig.collapsedIds;
+    final keys = _collapsedBarKeys();
+    final available = _allPadKeys
+        .where((key) => !ids.contains(key.id))
+        .toList();
+    void move(int index, int delta) {
+      final target = index + delta;
+      if (target < 0 || target >= ids.length) return;
+      ids.insert(target, ids.removeAt(index));
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Collapsed Tools bar', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 4),
+        Text(
+          'Buttons on the Tools bar while the tools are hidden.',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        for (var i = 0; i < keys.length; i++)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 46,
+                  child: _padKeyIcon(keys[i].iconName) != null
+                      ? Icon(_padKeyIcon(keys[i].iconName), size: 18)
+                      : Text(
+                          keys[i].abbreviation,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.labelLarge,
+                        ),
+                ),
+                Expanded(
+                  child: Text(
+                    keys[i].name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodyMedium,
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.arrow_upward, size: 18),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Move left',
+                  onPressed: i == 0
+                      ? null
+                      : () => applyConfig(
+                          () => move(ids.indexOf(keys[i].id), -1),
+                        ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.arrow_downward, size: 18),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Move right',
+                  onPressed: i == keys.length - 1
+                      ? null
+                      : () =>
+                            applyConfig(() => move(ids.indexOf(keys[i].id), 1)),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, size: 18),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Remove from collapsed bar',
+                  onPressed: () => applyConfig(() => ids.remove(keys[i].id)),
+                ),
+              ],
+            ),
+          ),
+        if (keys.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text(
+              'No buttons on the collapsed bar.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        const SizedBox(height: 4),
+        if (available.isNotEmpty)
+          PopupMenuButton<String>(
+            tooltip: 'Add a button to the collapsed bar',
+            onSelected: (value) => applyConfig(() => ids.add(value)),
+            itemBuilder: (ctx) => [
+              for (final key in available)
+                PopupMenuItem(
+                  value: key.id,
+                  child: Text('${key.abbreviation} — ${key.name}'),
+                ),
+            ],
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                border: Border.all(color: theme.colorScheme.outline),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.add, size: 18),
+                  SizedBox(width: 4),
+                  Text('Add button'),
+                ],
+              ),
+            ),
+          ),
       ],
     );
   }

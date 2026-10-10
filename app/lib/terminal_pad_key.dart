@@ -130,11 +130,18 @@ class TerminalPadConfig {
     this.version = 1,
     required this.customKeys,
     required this.rows,
-  });
+    List<String>? collapsedIds,
+  }) : collapsedIds = collapsedIds ?? List<String>.from(defaultCollapsedIds);
 
   int version;
   List<TerminalPadKey> customKeys;
   List<TerminalPadRowConfig> rows;
+
+  /// Keys shown on the Tools bar while the tools are collapsed, left to right.
+  /// Independent of the two pad rows, which are hidden then.
+  List<String> collapsedIds;
+
+  static const defaultCollapsedIds = ['backspace', 'enter'];
 
   factory TerminalPadConfig.defaults() {
     return TerminalPadConfig(
@@ -156,12 +163,14 @@ class TerminalPadConfig {
     version: version,
     customKeys: customKeys.map((k) => k.copyWith()).toList(),
     rows: rows.map((r) => r.clone()).toList(),
+    collapsedIds: List<String>.from(collapsedIds),
   );
 
   Map<String, dynamic> toJson() => {
     'version': version,
     'customKeys': customKeys.map((k) => k.toJson()).toList(),
     'rows': rows.map((r) => r.toJson()).toList(),
+    'collapsedIds': collapsedIds,
   };
 
   String encode() => jsonEncode(toJson());
@@ -197,10 +206,16 @@ class TerminalPadConfig {
         rows.add(defaults.rows[rows.length]);
       }
     }
+    // A blob saved before the collapsed bar existed gets its defaults; an
+    // empty list is the user's choice of no buttons and is kept.
+    final rawCollapsed = json['collapsedIds'];
     return TerminalPadConfig(
       version: json['version'] is int ? json['version'] as int : 1,
       customKeys: customKeys,
       rows: rows,
+      collapsedIds: rawCollapsed is List
+          ? rawCollapsed.map((e) => e.toString()).toList()
+          : null,
     );
   }
 
