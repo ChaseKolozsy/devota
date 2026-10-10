@@ -2206,6 +2206,88 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     );
   }
 
+  /// The text box's selection menu. With the phone keyboard locked off the
+  /// box is read-only, which leaves Android only Copy; Cut and Paste are put
+  /// back so text can still be moved around without the keyboard.
+  Widget _composerContextMenu(
+    BuildContext context,
+    EditableTextState editable,
+  ) {
+    final items = List<ContextMenuButtonItem>.of(
+      editable.contextMenuButtonItems,
+    );
+    if (_nativeKeyboardLocked) {
+      final selection = _composerController.selection;
+      final hasSelection = selection.isValid && !selection.isCollapsed;
+      bool has(ContextMenuButtonType type) =>
+          items.any((item) => item.type == type);
+      if (hasSelection && !has(ContextMenuButtonType.cut)) {
+        items.insert(
+          0,
+          ContextMenuButtonItem(
+            type: ContextMenuButtonType.cut,
+            onPressed: () {
+              editable.hideToolbar();
+              unawaited(cutComposerSelection());
+            },
+          ),
+        );
+      }
+      if (!has(ContextMenuButtonType.paste)) {
+        items.add(
+          ContextMenuButtonItem(
+            type: ContextMenuButtonType.paste,
+            onPressed: () {
+              editable.hideToolbar();
+              unawaited(pasteIntoComposer());
+            },
+          ),
+        );
+      }
+    }
+    return AdaptiveTextSelectionToolbar.buttonItems(
+      anchors: editable.contextMenuAnchors,
+      buttonItems: items,
+    );
+  }
+
+  /// Moves the text box's selection to the clipboard.
+  @visibleForTesting
+  Future<void> cutComposerSelection() async {
+    final value = _composerController.value;
+    final selection = value.selection;
+    if (!selection.isValid || selection.isCollapsed) return;
+    await Clipboard.setData(
+      ClipboardData(text: selection.textInside(value.text)),
+    );
+    _composerController.value = TextEditingValue(
+      text: selection.textBefore(value.text) + selection.textAfter(value.text),
+      selection: TextSelection.collapsed(offset: selection.start),
+    );
+  }
+
+  /// Puts the clipboard text in place of the selection (or at the end).
+  @visibleForTesting
+  Future<void> pasteIntoComposer() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final pasted = data?.text;
+    if (pasted == null || pasted.isEmpty) return;
+    final value = _composerController.value;
+    final selection = value.selection.isValid
+        ? value.selection
+        : TextSelection.collapsed(offset: value.text.length);
+    final text =
+        selection.textBefore(value.text) +
+        pasted +
+        selection.textAfter(value.text);
+    _composerController.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(
+        offset: selection.start + pasted.length,
+      ),
+    );
+  }
+
   void _submitComposer() {
     final text = _composerController.text.trim();
     if (text.isEmpty || !_connected) return;
@@ -4765,6 +4847,7 @@ class _SshTerminalTabState extends State<SshTerminalTab>
                         textCapitalization: TextCapitalization.none,
                         textInputAction: TextInputAction.send,
                         readOnly: _nativeKeyboardLocked,
+                        contextMenuBuilder: _composerContextMenu,
                         showCursor: !_nativeKeyboardLocked,
                         keyboardType: _nativeKeyboardLocked
                             ? TextInputType.none
