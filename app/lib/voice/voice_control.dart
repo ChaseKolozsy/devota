@@ -88,6 +88,13 @@ class VoiceReply {
 
 typedef VoiceTimerFactory = Timer Function(Duration, void Function());
 
+/// "Command", "Transcription", "Mixed": what the owner says and hears.
+String modeName(VoiceMode mode) => switch (mode) {
+  VoiceMode.commands => 'Command',
+  VoiceMode.transcription => 'Transcription',
+  VoiceMode.mixed => 'Mixed',
+};
+
 /// Turns each utterance into one action on [surface].
 class VoiceControl extends ChangeNotifier {
   VoiceControl({
@@ -95,7 +102,14 @@ class VoiceControl extends ChangeNotifier {
     this.matcher = const VoiceCommandMatcher(),
     VoiceTimerFactory? timer,
     this.speak,
+    this.onModeChanged,
   }) : _timer = timer ?? Timer.new;
+
+  /// Mixed, commands only, or transcription; switched by voice.
+  VoiceMode mode = VoiceMode.mixed;
+
+  /// The owner switched modes by voice (the tab remembers it).
+  final void Function(VoiceMode mode)? onModeChanged;
 
   static const confirmTimeout = Duration(seconds: 10);
 
@@ -118,10 +132,14 @@ class VoiceControl extends ChangeNotifier {
   VoiceReply handle(String utterance) {
     final heard = utterance.trim();
     if (heard.isEmpty) return const VoiceReply();
-    final match = matcher.match(heard, surface.voiceTargets);
+    final match = matcher.match(heard, surface.voiceTargets, mode: mode);
     final reply = _decide(heard, match);
-    // Any command stops a reading first; dictation lets it carry on.
-    final dictation = match is DictationMatch || reply.tone == 'dictation';
+    // Any command stops a reading first; dictation (and words command mode
+    // ignores) let it carry on.
+    final dictation =
+        match is DictationMatch ||
+        match is NotACommandMatch ||
+        reply.tone == 'dictation';
     return dictation ? reply : reply._stoppingReading();
   }
 
@@ -143,6 +161,22 @@ class VoiceControl extends ChangeNotifier {
       cancelPending();
     }
 
+    if (match is ModeMatch) {
+      final changed = mode != match.mode;
+      mode = match.mode;
+      if (changed) onModeChanged?.call(mode);
+      final name = modeName(mode);
+      return _status(
+        '$name mode',
+        VoiceReply(tone: 'command', speak: '$name mode'),
+      );
+    }
+    if (match is NotACommandMatch) {
+      return _status(
+        "heard '$heard' — not a command",
+        const VoiceReply(tone: 'error'),
+      );
+    }
     if (match is StopListeningMatch) {
       return _status('stopped', const VoiceReply(tone: 'command', stop: true));
     }
@@ -209,6 +243,8 @@ class VoiceControl extends ChangeNotifier {
       case StopListeningMatch():
       case StopReadingMatch():
       case ReadMatch():
+      case ModeMatch():
+      case NotACommandMatch():
         return const VoiceReply();
     }
   }
@@ -336,9 +372,14 @@ class VoiceControlSession extends ChangeNotifier {
     this.requestMicrophone,
     VoiceTimerFactory? timer,
     bool active = true,
+    void Function(VoiceMode mode)? onModeChanged,
   }) : _channel = channel ?? defaultChannel {
-    control = VoiceControl(surface: surface, timer: timer, speak: _speak)
-      ..addListener(_controlChanged);
+    control = VoiceControl(
+      surface: surface,
+      timer: timer,
+      speak: _speak,
+      onModeChanged: onModeChanged,
+    )..addListener(_controlChanged);
     setActive(active);
   }
 
@@ -410,7 +451,12 @@ class VoiceControlSession extends ChangeNotifier {
 
   /// "Voice: heard 'page up' — Page Up", or why it stopped.
   String? get statusLine {
-    if (_enabled) return 'Voice: ${control.statusLine}';
+    if (_enabled) {
+      final mode = control.mode == VoiceMode.mixed
+          ? ''
+          : ' (${modeName(control.mode).toLowerCase()})';
+      return 'Voice$mode: ${control.statusLine}';
+    }
     if (message != null) return 'Voice: $message';
     return null;
   }

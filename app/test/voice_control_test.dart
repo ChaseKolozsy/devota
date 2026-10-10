@@ -248,6 +248,58 @@ void main() {
     expect(reply.toJson()['stop'], isTrue);
   });
 
+  group('modes', () {
+    test('command mode: commands act, nothing else is typed', () {
+      final reply = control.handle('command mode');
+      expect(reply.speak, 'Command mode');
+      expect(control.mode, VoiceMode.commands);
+      expect(control.handle('page up').tone, 'command');
+      expect(surface.ran, ['page_up']);
+      final noise = control.handle('hey what was that');
+      expect(noise.tone, 'error');
+      expect(noise.stopReading, isFalse, reason: 'noise never stops a read');
+      expect(surface.composer, isEmpty);
+      expect(control.statusLine, "heard 'hey what was that' — not a command");
+    });
+
+    test('transcription mode: everything is typed but the escapes', () {
+      control.handle('dictation mode');
+      expect(control.mode, VoiceMode.transcription);
+      control.handle('page up');
+      control.handle('read screen');
+      expect(surface.ran, isEmpty);
+      expect(surface.composer, 'page up read screen');
+      control.handle('delete 4 words');
+      expect(surface.composer, isEmpty);
+      control.handle('fix the build');
+      control.handle('send');
+      expect(surface.sends, 1);
+      control.handle('command mode');
+      expect(control.mode, VoiceMode.commands);
+    });
+
+    test('mixed mode is the default and comes back by name', () {
+      expect(control.mode, VoiceMode.mixed);
+      control.handle('transcription mode');
+      control.handle('normal mode');
+      expect(control.mode, VoiceMode.mixed);
+      control.handle('fix it');
+      expect(surface.composer, 'fix it');
+    });
+
+    test('a switch is reported once for the tab to remember', () {
+      final changes = <VoiceMode>[];
+      final remembering = VoiceControl(
+        surface: surface,
+        onModeChanged: changes.add,
+      );
+      remembering.handle('command mode');
+      remembering.handle('command mode');
+      remembering.handle('mixed mode');
+      expect(changes, [VoiceMode.commands, VoiceMode.mixed]);
+    });
+  });
+
   group('reading aloud', () {
     List<String> fixture(String name) =>
         File('test/fixtures/voice_read/$name').readAsLinesSync();

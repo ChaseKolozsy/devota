@@ -256,6 +256,24 @@ class ComposerEditMatch extends VoiceMatch {
   final int count;
 }
 
+/// How utterances are taken. mixed: a whole-phrase command acts, anything
+/// else is dictated. commands: only commands act; anything else is dropped.
+/// transcription: everything is dictated, except the few phrases that leave
+/// it or fix the text ([VoiceCommandMatcher.match]).
+enum VoiceMode { mixed, commands, transcription }
+
+/// "command mode", "transcription mode", "mixed mode".
+class ModeMatch extends VoiceMatch {
+  const ModeMatch(this.mode);
+  final VoiceMode mode;
+}
+
+/// Command mode heard something that names no command.
+class NotACommandMatch extends VoiceMatch {
+  const NotACommandMatch(this.text);
+  final String text;
+}
+
 /// Anything else: text for the Type command box, exactly as heard.
 class DictationMatch extends VoiceMatch {
   const DictationMatch(this.text);
@@ -273,6 +291,18 @@ class VoiceCommandMatcher {
   static const _readScreen = {'read screen', 'read the screen'};
   static const _readReply = {'read reply', 'read the reply'};
   static const _stopReading = {'stop reading'};
+  static const _modes = {
+    'command mode': VoiceMode.commands,
+    'commands mode': VoiceMode.commands,
+    'command only': VoiceMode.commands,
+    'commands only': VoiceMode.commands,
+    'transcription mode': VoiceMode.transcription,
+    'transcribe mode': VoiceMode.transcription,
+    'dictation mode': VoiceMode.transcription,
+    'typing mode': VoiceMode.transcription,
+    'mixed mode': VoiceMode.mixed,
+    'normal mode': VoiceMode.mixed,
+  };
   static const _readMessage = {
     'repeat',
     'repeat that',
@@ -308,12 +338,25 @@ class VoiceCommandMatcher {
     };
   }
 
-  VoiceMatch match(String utterance, List<VoiceTarget> targets) {
+  /// In [VoiceMode.transcription] only these still act: leaving the mode,
+  /// stop listening / reading, send, and the text-box edits (clear,
+  /// backspace N, delete N words). Everything else is dictated.
+  VoiceMatch match(
+    String utterance,
+    List<VoiceTarget> targets, {
+    VoiceMode mode = VoiceMode.mixed,
+  }) {
     final text = utterance.trim();
     final spoken = normalizeSpoken(text);
     if (spoken.isEmpty) return DictationMatch(text);
+    final switchTo = _modes[spoken];
+    if (switchTo != null) return ModeMatch(switchTo);
     if (_stop.contains(spoken)) return const StopListeningMatch();
     if (_stopReading.contains(spoken)) return const StopReadingMatch();
+    if (mode == VoiceMode.transcription) {
+      if (_send.contains(spoken)) return const SendMatch();
+      return _composerEdit(spoken) ?? DictationMatch(text);
+    }
     if (_readScreen.contains(spoken)) return const ReadMatch(ReadTarget.screen);
     if (_readReply.contains(spoken)) return const ReadMatch(ReadTarget.reply);
     if (_readMessage.contains(spoken)) {
@@ -326,7 +369,9 @@ class VoiceCommandMatcher {
     if (edit != null) return edit;
     final target = vocabulary(targets)[spoken];
     if (target != null) return TargetMatch(target);
-    return DictationMatch(text);
+    return mode == VoiceMode.commands
+        ? NotACommandMatch(text)
+        : DictationMatch(text);
   }
 
   ComposerEditMatch? _composerEdit(String spoken) {

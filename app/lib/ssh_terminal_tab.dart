@@ -484,6 +484,7 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     active: widget.active,
     requestMicrophone:
         widget.testHooks?.requestMicrophone ?? _voice.requestMicrophone,
+    onModeChanged: (mode) => unawaited(_saveVoiceMode(mode)),
   );
   late final _notificationBridge = TerminalNotificationBridge(
     _watch,
@@ -623,6 +624,9 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     }
     if (oldWidget.active != widget.active) {
       _voiceSession.setActive(widget.active);
+      if (widget.active) {
+        unawaited(SharedPreferences.getInstance().then(_applyVoiceMode));
+      }
       _notificationBridge.setActive(widget.active);
       if (!widget.active) {
         _terminalFocusNode.unfocus();
@@ -888,7 +892,22 @@ class _SshTerminalTabState extends State<SshTerminalTab>
   Future<void> _loadTerminalToolVisibility() async {
     final prefs = await SharedPreferences.getInstance();
     final visible = prefs.getBool(_terminalToolsVisibleKey) ?? true;
+    _applyVoiceMode(prefs);
     if (mounted) setState(() => _terminalToolsVisible = visible);
+  }
+
+  /// One mode for every computer: a tab coming on screen takes the mode last
+  /// chosen in any of them.
+  void _applyVoiceMode(SharedPreferences prefs) {
+    final mode = VoiceMode.values.asNameMap()[prefs.getString(_voiceModeKey)];
+    if (mode != null) _voiceSession.control.mode = mode;
+  }
+
+  static const _voiceModeKey = 'voice_mode';
+
+  Future<void> _saveVoiceMode(VoiceMode mode) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_voiceModeKey, mode.name);
   }
 
   Future<void> _saveTerminalToolVisibility() async {
