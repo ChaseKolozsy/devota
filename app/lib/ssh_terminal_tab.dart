@@ -3620,31 +3620,43 @@ class _SshTerminalTabState extends State<SshTerminalTab>
   ];
 
   /// The collapsed bar's own buttons, right-aligned; the space left of them
-  /// still opens the tools. A window two buttons wide; any more scroll
-  /// sideways, like the pad rows.
+  /// still opens the tools. A window four buttons wide; any more scroll
+  /// sideways, like the pad rows. On a narrow bar the four shrink to fit
+  /// rather than push one out of view.
   Widget _buildCollapsedBarKeys(List<TerminalPadKey> keys) {
     final visible = keys.length < _collapsedBarVisibleKeys
         ? keys.length
         : _collapsedBarVisibleKeys;
-    return Align(
-      alignment: Alignment.centerRight,
-      child: SizedBox(
-        width: visible * _padFixedKeyWidth + (visible - 1) * 4,
-        height: 30,
-        child: ListView.separated(
-          key: const ValueKey('collapsed-tools-keys'),
-          scrollDirection: Axis.horizontal,
-          padding: EdgeInsets.zero,
-          physics: const ClampingScrollPhysics(),
-          itemCount: keys.length,
-          separatorBuilder: (_, _) => const SizedBox(width: 4),
-          itemBuilder: (_, index) => _buildPadFixedRightButton(keys[index]),
-        ),
-      ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final gaps = (visible - 1) * 4.0;
+        final keyWidth = ((constraints.maxWidth - gaps) / visible).clamp(
+          _collapsedBarMinKeyWidth,
+          _padFixedKeyWidth,
+        );
+        return Align(
+          alignment: Alignment.centerRight,
+          child: SizedBox(
+            width: (visible * keyWidth + gaps).clamp(0, constraints.maxWidth),
+            height: 30,
+            child: ListView.separated(
+              key: const ValueKey('collapsed-tools-keys'),
+              scrollDirection: Axis.horizontal,
+              padding: EdgeInsets.zero,
+              physics: const ClampingScrollPhysics(),
+              itemCount: keys.length,
+              separatorBuilder: (_, _) => const SizedBox(width: 4),
+              itemBuilder: (_, index) =>
+                  _buildPadFixedRightButton(keys[index], width: keyWidth),
+            ),
+          ),
+        );
+      },
     );
   }
 
-  static const _collapsedBarVisibleKeys = 2;
+  static const _collapsedBarVisibleKeys = 4;
+  static const double _collapsedBarMinKeyWidth = 44;
 
   Widget _buildTerminalControlPad(ThemeData theme) {
     return Material(
@@ -3930,7 +3942,10 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     child: child,
   );
 
-  Widget _buildPadFixedRightButton(TerminalPadKey key) {
+  Widget _buildPadFixedRightButton(
+    TerminalPadKey key, {
+    double width = _padFixedKeyWidth,
+  }) {
     final enabled =
         (_connected || key.enabledWhenDisconnected) && !_inputLocked;
     final icon = _padKeyIcon(key.iconName);
@@ -3944,11 +3959,11 @@ class _SshTerminalTabState extends State<SshTerminalTab>
         child: _keyRepeatListener(
           SizedBox(
             height: 30,
-            width: _padFixedKeyWidth,
+            width: width,
             child: OutlinedButton(
               style: OutlinedButton.styleFrom(
                 visualDensity: VisualDensity.compact,
-                minimumSize: const Size(_padFixedKeyWidth, 30),
+                minimumSize: Size(width, 30),
                 padding: const EdgeInsets.symmetric(horizontal: 4),
                 tapTargetSize: MaterialTapTargetSize.shrinkWrap,
               ),

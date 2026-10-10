@@ -8,7 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// With the tools collapsed, the Tools bar carries its own buttons: Backspace
-/// and Enter unless the user picks others, two visible, the rest a swipe away.
+/// and Enter unless the user picks others, four visible, the rest a swipe away.
 void main() {
   late List<String> writes;
 
@@ -88,7 +88,7 @@ void main() {
     expect(writes.toSet(), {'\x7F'});
   });
 
-  testWidgets('more than two buttons scroll, two at a time', (tester) async {
+  testWidgets('more than four buttons scroll, four at a time', (tester) async {
     SharedPreferences.setMockInitialValues(
       prefs(collapsedIds: ['tab', 'esc', 'home', 'end', 'enter']),
     );
@@ -96,7 +96,6 @@ void main() {
     final window = tester.getRect(
       find.byKey(const ValueKey('collapsed-tools-keys')),
     );
-    expect(window.width, lessThan(140));
     bool shown(String name) {
       final f = key(name);
       if (f.evaluate().isEmpty) return false;
@@ -104,8 +103,9 @@ void main() {
       return r.left >= window.left - 1 && r.right <= window.right + 1;
     }
 
-    expect(shown('Tab'), isTrue);
-    expect(shown('Escape'), isTrue);
+    for (final name in ['Tab', 'Escape', 'Home', 'End']) {
+      expect(shown(name), isTrue, reason: name);
+    }
     expect(shown('Enter'), isFalse);
 
     await tester.drag(
