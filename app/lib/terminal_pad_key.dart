@@ -143,6 +143,18 @@ class TerminalPadConfig {
 
   static const defaultCollapsedIds = ['backspace', 'enter'];
 
+  /// Adds [id] to the collapsed bar just left of any Backspace/Enter at its
+  /// right end, so those stay in the spots beside the composer's record and
+  /// send buttons.
+  void addCollapsed(String id) {
+    if (collapsedIds.contains(id)) return;
+    var at = collapsedIds.length;
+    while (at > 0 && defaultCollapsedIds.contains(collapsedIds[at - 1])) {
+      at--;
+    }
+    collapsedIds.insert(at, id);
+  }
+
   factory TerminalPadConfig.defaults() {
     return TerminalPadConfig(
       customKeys: <TerminalPadKey>[],

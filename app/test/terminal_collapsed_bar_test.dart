@@ -88,14 +88,15 @@ void main() {
     expect(writes.toSet(), {'\x7F'});
   });
 
-  testWidgets('more than four buttons scroll, four at a time', (tester) async {
+  testWidgets('more than four scroll, opening at the right end', (
+    tester,
+  ) async {
     SharedPreferences.setMockInitialValues(
-      prefs(collapsedIds: ['tab', 'esc', 'home', 'end', 'enter']),
+      prefs(collapsedIds: ['tab', 'esc', 'home', 'end', 'backspace', 'enter']),
     );
     await pumpTab(tester);
-    final window = tester.getRect(
-      find.byKey(const ValueKey('collapsed-tools-keys')),
-    );
+    final list = find.byKey(const ValueKey('collapsed-tools-keys'));
+    final window = tester.getRect(list);
     bool shown(String name) {
       final f = key(name);
       if (f.evaluate().isEmpty) return false;
@@ -103,21 +104,37 @@ void main() {
       return r.left >= window.left - 1 && r.right <= window.right + 1;
     }
 
-    for (final name in ['Tab', 'Escape', 'Home', 'End']) {
+    for (final name in ['Home', 'End', 'Backspace', 'Enter']) {
       expect(shown(name), isTrue, reason: name);
     }
-    expect(shown('Enter'), isFalse);
-
-    await tester.drag(
-      find.byKey(const ValueKey('collapsed-tools-keys')),
-      const Offset(-400, 0),
-    );
-    await tester.pumpAndSettle();
-    expect(shown('Enter'), isTrue);
     expect(shown('Tab'), isFalse);
-    await tester.tap(key('Enter'));
+    expect(shown('Escape'), isFalse);
+    // Backspace and Enter hold the third and fourth spots, Enter at the edge.
+    final enter = tester.getRect(key('Enter'));
+    final backspace = tester.getRect(key('Backspace'));
+    expect(enter.right, closeTo(window.right, 1));
+    expect(backspace.right, lessThan(enter.left));
+    expect(window.right, greaterThan(360 - 16), reason: 'nothing right of it');
+
+    await tester.drag(list, const Offset(400, 0));
+    await tester.pumpAndSettle();
+    expect(shown('Tab'), isTrue);
+    expect(shown('Enter'), isFalse);
+    await tester.tap(key('Tab'));
     await tester.pump(const Duration(seconds: 1));
-    expect(writes, ['\r']);
+    expect(writes, ['\t']);
+  });
+
+  test('added buttons go left of Backspace and Enter', () {
+    final config = TerminalPadConfig.defaults();
+    config.addCollapsed('tab');
+    config.addCollapsed('esc');
+    expect(config.collapsedIds, ['tab', 'esc', 'backspace', 'enter']);
+    config.addCollapsed('esc');
+    expect(config.collapsedIds, ['tab', 'esc', 'backspace', 'enter']);
+    config.collapsedIds = ['enter', 'home'];
+    config.addCollapsed('end');
+    expect(config.collapsedIds, ['enter', 'home', 'end']);
   });
 
   testWidgets('no buttons chosen leaves the hint', (tester) async {

@@ -3551,6 +3551,21 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     final collapsedKeys = _terminalToolsVisible
         ? const <TerminalPadKey>[]
         : _collapsedBarKeys();
+    final tune = IconButton(
+      icon: const Icon(Icons.tune, size: 20),
+      visualDensity: VisualDensity.compact,
+      tooltip: 'Customize control pad',
+      onPressed: _showControlPadSettingsSheet,
+    );
+    final exitScroll = TextButton(
+      style: TextButton.styleFrom(
+        visualDensity: VisualDensity.compact,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      onPressed: _exitTmuxScrollMode,
+      child: const Text('Exit scroll'),
+    );
     return Material(
       color: theme.colorScheme.surfaceContainer,
       child: InkWell(
@@ -3588,25 +3603,14 @@ class _SshTerminalTabState extends State<SshTerminalTab>
                       ),
                     ),
                   )
-                else
+                else ...[
+                  // Left of the buttons, so Enter keeps the right edge.
+                  if (_tmuxScrollMode) exitScroll,
+                  tune,
                   Expanded(child: _buildCollapsedBarKeys(collapsedKeys)),
-                if (_tmuxScrollMode)
-                  TextButton(
-                    style: TextButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    ),
-                    onPressed: _exitTmuxScrollMode,
-                    child: const Text('Exit scroll'),
-                  ),
-                if (_terminalToolsVisible || collapsedKeys.isNotEmpty)
-                  IconButton(
-                    icon: const Icon(Icons.tune, size: 20),
-                    visualDensity: VisualDensity.compact,
-                    tooltip: 'Customize control pad',
-                    onPressed: _showControlPadSettingsSheet,
-                  ),
+                ],
+                if (_tmuxScrollMode && collapsedKeys.isEmpty) exitScroll,
+                if (_terminalToolsVisible) tune,
               ],
             ),
           ),
@@ -3621,7 +3625,8 @@ class _SshTerminalTabState extends State<SshTerminalTab>
 
   /// The collapsed bar's own buttons, right-aligned; the space left of them
   /// still opens the tools. A window four buttons wide; any more scroll
-  /// sideways, like the pad rows. On a narrow bar the four shrink to fit
+  /// sideways, like the pad rows, and the window opens at the right end. On
+  /// a narrow bar the four shrink to fit
   /// rather than push one out of view.
   Widget _buildCollapsedBarKeys(List<TerminalPadKey> keys) {
     final visible = keys.length < _collapsedBarVisibleKeys
@@ -3644,10 +3649,15 @@ class _SshTerminalTabState extends State<SshTerminalTab>
               scrollDirection: Axis.horizontal,
               padding: EdgeInsets.zero,
               physics: const ClampingScrollPhysics(),
+              // Opens at the right end, so the last buttons (Backspace and
+              // Enter by default) sit above the composer's record and send.
+              reverse: true,
               itemCount: keys.length,
               separatorBuilder: (_, _) => const SizedBox(width: 4),
-              itemBuilder: (_, index) =>
-                  _buildPadFixedRightButton(keys[index], width: keyWidth),
+              itemBuilder: (_, index) => _buildPadFixedRightButton(
+                keys[keys.length - 1 - index],
+                width: keyWidth,
+              ),
             ),
           ),
         );
@@ -4359,7 +4369,8 @@ class _SshTerminalTabState extends State<SshTerminalTab>
         if (available.isNotEmpty)
           PopupMenuButton<String>(
             tooltip: 'Add a button to the collapsed bar',
-            onSelected: (value) => applyConfig(() => ids.add(value)),
+            onSelected: (value) =>
+                applyConfig(() => _padConfig.addCollapsed(value)),
             itemBuilder: (ctx) => [
               for (final key in available)
                 PopupMenuItem(
