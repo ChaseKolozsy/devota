@@ -30,11 +30,23 @@ class ProposedCommand {
 /// Collects the commands waiting on a computer's DevOTA server
 /// (`GET /terminal/compose`). The server hands each one over once.
 class TerminalComposeInbox {
-  static Future<List<ProposedCommand>> take(Dio dio, String serverUrl) async {
+  static Future<List<ProposedCommand>> take(Dio dio, String serverUrl) =>
+      _take(dio, serverUrl, '/terminal/compose');
+
+  /// Messages an agent wants said aloud (`GET /terminal/speak`), in the same
+  /// shape; their text may span several lines.
+  static Future<List<ProposedCommand>> takeSpeech(Dio dio, String serverUrl) =>
+      _take(dio, serverUrl, '/terminal/speak');
+
+  static Future<List<ProposedCommand>> _take(
+    Dio dio,
+    String serverUrl,
+    String path,
+  ) async {
     final base = serverUrl.trim().replaceAll(RegExp(r'/+$'), '');
     if (base.isEmpty) return const [];
     final resp = await dio.get<Object?>(
-      '$base/terminal/compose',
+      '$base$path',
       options: Options(
         sendTimeout: const Duration(seconds: 5),
         receiveTimeout: const Duration(seconds: 5),

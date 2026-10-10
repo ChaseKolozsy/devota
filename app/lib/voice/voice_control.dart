@@ -42,6 +42,10 @@ abstract class VoiceSurface {
   /// The rows the terminal is showing right now, top to bottom, read from
   /// the tab's own terminal buffer.
   List<String> get terminalScreenLines;
+
+  /// The last message an agent asked to have spoken (devota_speak), as it was
+  /// read aloud, or null.
+  String? get lastAgentMessage => null;
 }
 
 /// What the Android service does after an utterance.
@@ -211,30 +215,40 @@ class VoiceControl extends ChangeNotifier {
 
   static const _readingScreen = 'reading screen…';
   static const _readingReply = 'reading reply…';
+  static const _readingMessage = 'reading message…';
 
   VoiceReply _read(ReadTarget target) {
     final lines = surface.terminalScreenLines;
-    final reading = switch (target) {
-      ReadTarget.screen => readScreen(lines),
-      ReadTarget.reply => readReply(lines),
+    final text = switch (target) {
+      ReadTarget.screen => readScreen(lines).text,
+      ReadTarget.reply => readReply(lines).text,
+      ReadTarget.message => surface.lastAgentMessage ?? '',
     };
-    final chunks = speechChunks(reading.text);
+    final chunks = speechChunks(text);
     if (chunks.isEmpty) {
       return _status(
         'nothing to read',
         const VoiceReply(tone: 'error', speak: 'Nothing to read'),
       );
     }
-    return _status(
-      target == ReadTarget.screen ? _readingScreen : _readingReply,
-      VoiceReply(tone: 'command', read: chunks),
-    );
+    return _status(switch (target) {
+      ReadTarget.screen => _readingScreen,
+      ReadTarget.reply => _readingReply,
+      ReadTarget.message => _readingMessage,
+    }, VoiceReply(tone: 'command', read: chunks));
   }
+
+  /// The phone began reading an agent's message unasked.
+  void messageReadingStarted() => _status(_readingMessage, const VoiceReply());
 
   /// The phone finished (or gave up) reading aloud: finished | stopped |
   /// failed.
   void readingEnded(String reason) {
-    if (statusLine != _readingScreen && statusLine != _readingReply) return;
+    if (statusLine != _readingScreen &&
+        statusLine != _readingReply &&
+        statusLine != _readingMessage) {
+      return;
+    }
     statusLine = switch (reason) {
       'finished' => 'finished reading',
       'failed' => 'could not read aloud',
@@ -372,6 +386,28 @@ class VoiceControlSession extends ChangeNotifier {
   bool get enabled => _enabled;
   bool get starting => _starting;
 
+  /// The session whose voice control is listening right now, if any. Only
+  /// one owns the recognizer, whichever terminal the message came from.
+  static VoiceControlSession? get listening {
+    final owner = _owners[defaultChannel.name];
+    return owner != null && owner._enabled && !owner._disposed ? owner : null;
+  }
+
+  /// Reads [chunks] aloud through the voice service, which pauses listening
+  /// while it speaks and stops on "stop reading" or any command. False when
+  /// voice control is not running.
+  Future<bool> readMessage(List<String> chunks) async {
+    if (!_enabled || _disposed || chunks.isEmpty) return false;
+    try {
+      return await _channel.invokeMethod<bool>('read', {'chunks': chunks}) ??
+          false;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
   /// "Voice: heard 'page up' — Page Up", or why it stopped.
   String? get statusLine {
     if (_enabled) return 'Voice: ${control.statusLine}';
@@ -460,6 +496,8 @@ class VoiceControlSession extends ChangeNotifier {
       case 'reading':
         if (args['active'] != true) {
           control.readingEnded(args['reason']?.toString() ?? 'stopped');
+        } else if (args['reason'] == 'message') {
+          control.messageReadingStarted();
         }
         return null;
       case 'stopped':

@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Say a message out loud on the DevOTA phone connected to this computer.
+
+For an agent whose person is listening, not reading (driving): progress,
+results, questions. Write it to be heard: short plain sentences, no markdown
+or code. The text is an argument, or stdin when the argument is "-" or absent.
+
+    scripts/devota-speak 'Tests pass. Shall I push?'
+    echo 'Build finished.' | scripts/devota-speak --label Codex
+
+Sending from this machine over 127.0.0.1 needs nothing else. Any other route
+(a LAN/VPN address, a port proxy) needs the server's token: it is read from
+$DEVOTA_COMPOSE_TOKEN, else from <repo-root>/.devota-cache/compose-token.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("text", nargs="?", default="-", help='the message, or "-" for stdin')
+    parser.add_argument("--server", default=os.environ.get("DEVOTA_SERVER_URL", "http://127.0.0.1:8082"),
+                        help="this computer's DevOTA server (default $DEVOTA_SERVER_URL or http://127.0.0.1:8082)")
+    parser.add_argument("--label", default=os.environ.get("DEVOTA_SPEAK_LABEL", "Agent"),
+                        help="who is sending it, shown on the phone")
+    parser.add_argument("--repo-root", default=os.environ.get("DEVOTA_REPO_ROOT", str(Path(__file__).resolve().parent.parent)),
+                        help="the server's --repo-root, where its token lives")
+    args = parser.parse_args()
+    text = sys.stdin.read() if args.text == "-" else args.text
+    if not text.strip():
+        print("devota-speak: nothing to say", file=sys.stderr)
+        return 1
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("DEVOTA_COMPOSE_TOKEN", "").strip()
+    if not token:
+        try:
+            token = (Path(args.repo_root) / ".devota-cache" / "compose-token").read_text(encoding="utf-8").strip()
+        except OSError:
+            token = ""
+    if token:
+        headers["X-DevOTA-Compose-Token"] = token
+    request = urllib.request.Request(
+        args.server.rstrip("/") + "/terminal/speak",
+        data=json.dumps({"text": text.strip(), "label": args.label}).encode(),
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            sent = json.load(response)
+    except urllib.error.HTTPError as exc:
+        print(f"devota-speak: HTTP {exc.code}: {exc.reason}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"devota-speak: cannot reach {args.server}: {exc.reason}", file=sys.stderr)
+        return 1
+    print(f"Sent (#{sent['id']}); the phone reads it aloud within a few seconds.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -3263,6 +3263,53 @@ def take_terminal_commands(now: float | None = None) -> dict[str, Any]:
     return {"status": "ok", "items": items}
 
 
+# Messages an agent wants spoken on the phone (devota_speak): progress
+# updates and questions for someone who is listening, not reading. Same senders
+# as the compose queue; shorter-lived, since a stale update is worse than none.
+SPEAK_MAX_CHARS = 4000
+SPEAK_TTL_SECONDS = 10 * 60
+SPEAK_MAX_PENDING = 10
+SPEAK_LOCK = threading.Lock()
+SPEAK_QUEUE: list[dict[str, Any]] = []
+SPEAK_NEXT_ID = [1]
+
+
+def _speak_expire(now: float) -> None:
+    SPEAK_QUEUE[:] = [item for item in SPEAK_QUEUE
+                      if now - item["createdAtEpoch"] < SPEAK_TTL_SECONDS][-SPEAK_MAX_PENDING:]
+
+
+def propose_speech(payload: dict[str, Any], now: float | None = None) -> dict[str, Any]:
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("text is required")
+    text = text.strip()
+    if len(text) > SPEAK_MAX_CHARS:
+        raise ValueError(f"text is longer than {SPEAK_MAX_CHARS} characters")
+    label = payload.get("label")
+    label = label.strip()[:80] if isinstance(label, str) else ""
+    now = time.time() if now is None else now
+    with SPEAK_LOCK:
+        _speak_expire(now)
+        item = {"id": SPEAK_NEXT_ID[0], "text": text, "label": label,
+                "createdAtEpoch": now,
+                "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
+        SPEAK_NEXT_ID[0] += 1
+        SPEAK_QUEUE.append(item)
+        _speak_expire(now)
+    return {"status": "ok", "id": item["id"]}
+
+
+def take_speech(now: float | None = None) -> dict[str, Any]:
+    """Hand over every pending message once; the phone reads them aloud."""
+    now = time.time() if now is None else now
+    with SPEAK_LOCK:
+        _speak_expire(now)
+        items = [{key: item[key] for key in ("id", "text", "label", "createdAt")} for item in SPEAK_QUEUE]
+        SPEAK_QUEUE.clear()
+    return {"status": "ok", "items": items}
+
+
 def make_handler(repo_root: Path, manifest_path: Path, manifest: dict[str, Any]):
     class DevotaHandler(SimpleHTTPRequestHandler):
         def send_json(self, payload: object, status: int = 200):
@@ -3424,6 +3471,16 @@ def make_handler(repo_root: Path, manifest_path: Path, manifest: dict[str, Any])
                     self.send_json(propose_terminal_command(payload))
                 except Exception as exc:
                     self.send_error(400, f"Command not accepted: {exc}")
+                return
+            if path == "/terminal/speak":
+                if not compose_sender_allowed(self.client_address[0], self.headers.get(COMPOSE_TOKEN_HEADER)):
+                    self.send_error(403, f"Send from this computer or with the {COMPOSE_TOKEN_HEADER} header")
+                    return
+                try:
+                    payload = parse_json_request(self, max_bytes=32 * 1024)
+                    self.send_json(propose_speech(payload))
+                except Exception as exc:
+                    self.send_error(400, f"Message not accepted: {exc}")
                 return
             if path == "/macros/resolve":
                 try:
@@ -3691,6 +3748,10 @@ def make_handler(repo_root: Path, manifest_path: Path, manifest: dict[str, Any])
 
             if path == "/terminal/compose":
                 self.send_json(take_terminal_commands())
+                return
+
+            if path == "/terminal/speak":
+                self.send_json(take_speech())
                 return
 
             if path == "/macros":

@@ -13,6 +13,8 @@ class FakeSurface implements VoiceSurface {
   bool canSend = true;
   String composer = '';
   List<String> screen = const [];
+  @override
+  String? lastAgentMessage;
   final ran = <String>[];
   int sends = 0;
   List<VoiceTarget> Function(FakeSurface) build = defaultTargets;
@@ -316,6 +318,19 @@ void main() {
       expect(control.handle('yes').stopReading, isFalse);
     });
 
+    test('repeat says the last agent message again', () {
+      expect(control.handle('repeat').speak, 'Nothing to read');
+      surface.lastAgentMessage = 'Claude says: Tests pass. Shall I push?';
+      for (final phrase in ['repeat', 'say that again', 'read message']) {
+        final reply = control.handle(phrase);
+        expect(reply.read, ['Claude says: Tests pass. Shall I push?']);
+        expect(control.statusLine, 'reading message…');
+      }
+      control.readingEnded('finished');
+      expect(control.statusLine, 'finished reading');
+      expect(control.handle('repeat after me').tone, 'dictation');
+    });
+
     test('the status line follows the phone to the end of the reading', () {
       surface.screen = fixture('plain_shell.txt');
       control.handle('read screen');
@@ -369,6 +384,30 @@ void main() {
           );
       return codec.decodeEnvelope(reply!) as Map?;
     }
+
+    test('an agent message goes to the service only while listening', () async {
+      expect(await session.readMessage(['Claude says: done.']), isFalse);
+      expect(calls, isEmpty);
+      await session.setEnabled(true);
+      expect(await session.readMessage(['Claude says: done.']), isTrue);
+      expect(calls.last.method, 'read');
+      expect(calls.last.arguments, {
+        'chunks': ['Claude says: done.'],
+      });
+      const codec = StandardMethodCodec();
+      await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .handlePlatformMessage(
+            channel.name,
+            codec.encodeMethodCall(
+              const MethodCall('reading', {
+                'active': true,
+                'reason': 'message',
+              }),
+            ),
+            (_) {},
+          );
+      expect(session.statusLine, 'Voice: reading message…');
+    });
 
     test('toggle off: no service, and a stray transcript is refused', () async {
       expect(session.enabled, isFalse);

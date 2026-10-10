@@ -85,6 +85,16 @@ class TerminalNotificationBridge {
     }
     if (call.method == 'readerAction') {
       final args = Map<String, dynamic>.from(call.arguments as Map);
+      final message = _message;
+      if (message != null && !_bridges.any((b) => b._reading != null)) {
+        final action = args['action'];
+        if (action == 'replay') {
+          unawaited(_sayMessage(message));
+        } else if (action == 'stopReading' || action == 'interrupted') {
+          _message = null;
+        }
+        return;
+      }
       // One voice reads at a time; the bridge that started it owns it.
       final reader =
           _bridges.where((bridge) => bridge._reading != null).firstOrNull ??
@@ -178,7 +188,32 @@ class TerminalNotificationBridge {
     );
   }
 
+  /// The agent message being read with the phone voice (devota_speak while
+  /// voice control is off). Replay on the notification says it again.
+  static ({String title, String text})? _message;
+
+  /// Reads an agent's message aloud with the same phone voice and
+  /// notification controls as a conclusion, replacing any reading.
+  static Future<void> speakMessage(String title, String text) async {
+    for (final bridge in _bridges) {
+      if (bridge._reading != null) bridge._stopReading();
+    }
+    final message = (title: title, text: text);
+    _message = message;
+    await _sayMessage(message);
+  }
+
+  static Future<void> _sayMessage(({String title, String text}) message) =>
+      _channel
+          .invokeMethod<void>('speak', {
+            'text': message.text,
+            'title': message.title,
+            'earlier': false,
+          })
+          .catchError((Object _) {});
+
   Future<void> _listen(String paneId, String token) async {
+    _message = null;
     _stopReading();
     final request = _request;
     _readerError = null;

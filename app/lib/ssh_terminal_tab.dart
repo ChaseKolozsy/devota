@@ -33,6 +33,7 @@ import 'terminal_pad_key.dart';
 import 'terminal_profiles.dart';
 import 'voice_input_service.dart';
 import 'voice/voice_commands.dart';
+import 'voice/agent_message.dart';
 import 'voice/voice_control.dart';
 
 /// A foldable terminal tool bar (tmux / macros / cmds). When folded its content
@@ -2172,13 +2173,48 @@ class _SshTerminalTabState extends State<SshTerminalTab>
         widget.dio,
         widget.serverUrl,
       );
-      if (!mounted || _disposing || commands.isEmpty) return;
-      _receiveProposedCommands(commands);
+      if (!mounted || _disposing) return;
+      if (commands.isNotEmpty) _receiveProposedCommands(commands);
+      final messages = await TerminalComposeInbox.takeSpeech(
+        widget.dio,
+        widget.serverUrl,
+      );
+      if (!mounted || _disposing || messages.isEmpty) return;
+      await _receiveAgentMessages(messages);
     } catch (_) {
       // An unreachable server just means nothing arrives until it is back.
     } finally {
       _composeInboxBusy = false;
     }
+  }
+
+  String? _lastAgentMessage;
+
+  @override
+  String? get lastAgentMessage => _lastAgentMessage;
+
+  /// Says an agent's messages (devota_speak) aloud: through voice control
+  /// when it is listening, so the recognizer pauses and "stop reading" works,
+  /// otherwise with the phone voice and its Replay / Stop notification.
+  @visibleForTesting
+  Future<void> receiveAgentMessages(List<ProposedCommand> messages) =>
+      _receiveAgentMessages(messages);
+
+  Future<void> _receiveAgentMessages(List<ProposedCommand> messages) async {
+    final label = messages.last.label.isEmpty ? 'Agent' : messages.last.label;
+    final text = [for (final m in messages) m.text].join('\n');
+    final chunks = agentMessageChunks(label, text);
+    if (chunks.isEmpty) return;
+    _lastAgentMessage = chunks.join('\n');
+    setState(() => _status = '$label: ${speakableMessage(text)}');
+    if (await (VoiceControlSession.listening?.readMessage(chunks) ??
+        Future.value(false))) {
+      return;
+    }
+    await TerminalNotificationBridge.speakMessage(
+      '$label · ${_notificationLabel()}',
+      _lastAgentMessage!,
+    );
   }
 
   /// Puts the newest proposed command in the text box. Nothing is sent: the

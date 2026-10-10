@@ -1096,6 +1096,25 @@ server.registerTool(
 );
 
 server.registerTool(
+  "devota_speak",
+  {
+    title: "Say Something Out Loud on the Phone",
+    description: "Speak a message aloud on the DevOTA phone connected to this computer, for a person who is listening rather than reading (often driving). Use it for progress updates, results and questions you would otherwise only print. Write it to be heard: short plain sentences, no markdown, code, tables or long paths; say what happened and what you need. The person can answer by voice, which arrives in this terminal as their next message. Handed to the phone once; dropped after 10 minutes if no phone collects it.",
+    inputSchema: {
+      text: z.string().min(1).max(4000),
+      label: z.string().max(80).optional(),
+    },
+  },
+  async ({ text, label }) => textResult(
+    await buildServerJson("/terminal/speak", {
+      method: "POST",
+      data: { text, label: label || "Agent" },
+      headers: composeTokenHeaders(),
+    }),
+  ),
+);
+
+server.registerTool(
   "devota_macros_create",
   {
     title: "Create DevOTA Macro",

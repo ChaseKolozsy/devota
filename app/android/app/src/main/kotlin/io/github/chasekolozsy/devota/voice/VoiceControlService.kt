@@ -376,6 +376,28 @@ internal class VoiceControlService : Service(), LoopListener {
         }
     }
 
+    /**
+     * An agent's message (devota_speak), read like "read reply": chunk by
+     * chunk, listening between chunks, stopped by "stop reading" or any
+     * command. It waits for the owner to finish talking and for any reading
+     * in progress, rather than cutting either off.
+     */
+    internal fun readMessage(chunks: List<String>) {
+        val clean = chunks.filter { it.isNotBlank() }
+        if (clean.isEmpty()) return
+        handler.post(object : Runnable {
+            override fun run() {
+                if (stopped) return
+                if (loop.userSpeaking || reader.active) {
+                    handler.postDelayed(this, ReadAloud.POLL_MS)
+                    return
+                }
+                VoiceControl.onReading(true, "message")
+                reader.start(clean)
+            }
+        })
+    }
+
     internal fun speak(text: String) {
         if (stopped || text.isBlank()) return
         if (loop.userSpeaking) {

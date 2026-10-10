@@ -75,6 +75,14 @@ internal object VoiceControl {
                     }
                     result.success(null)
                 }
+                "read" -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        val chunks = (call.argument<List<*>>("chunks") ?: emptyList<Any>())
+                            .mapNotNull { it as? String }
+                        VoiceControlService.instance?.readMessage(chunks)
+                    }
+                    result.success(VoiceControlService.instance != null)
+                }
                 "update" -> {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         VoiceControlService.instance?.updateStatus(call.argument<String>("status") ?: "")

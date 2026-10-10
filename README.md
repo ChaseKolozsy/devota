@@ -444,6 +444,32 @@ with the token the server writes, readable only by its user, to
 `<repo-root>/.devota-cache/compose-token`; `devota-compose` and the MCP tool
 read it from there (or from `DEVOTA_COMPOSE_TOKEN`).
 
+## Messages spoken on the phone
+
+An agent can talk to the person instead of printing for them — progress,
+results, a question — for when they are listening, not reading (driving):
+
+```bash
+scripts/devota-speak 'Tests pass. Shall I push?' --label Claude
+echo 'Build finished.' | scripts/devota-speak --label Codex
+```
+
+MCP agents use the `devota_speak` tool. Any agent works: the message is plain
+text on this computer's server (`POST /terminal/speak`, up to 4000 characters,
+kept 10 minutes, handed over once; `GET /terminal/speak`), with the same
+senders and token as the compose queue. The phone says "Claude says: …":
+
+- with voice control on, through the voice service — listening pauses while it
+  speaks, the recognizer listens between sentences, and "stop reading" or any
+  command stops it; it waits for the person to finish talking and for any
+  reading in progress;
+- otherwise with the phone voice and its notification (Replay / Stop).
+
+Markdown, code blocks and links are not read out symbol by symbol. "Repeat"
+(or "say that again", "read message") says the last message again. The person
+answers by voice into the terminal's text box and says "send", so a whole
+back-and-forth works hands-free with any agent.
+
 ## Signing a computer's CLI in from the phone
 
 The key button in the terminal header signs a command-line tool on the

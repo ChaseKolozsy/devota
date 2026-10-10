@@ -224,7 +224,9 @@ class StopListeningMatch extends VoiceMatch {
   const StopListeningMatch();
 }
 
-enum ReadTarget { screen, reply }
+/// screen | reply: from the terminal. message: an agent's last spoken message
+/// (devota_speak), said again.
+enum ReadTarget { screen, reply, message }
 
 /// "read screen" / "read reply": speak the Terminal tab's visible text.
 class ReadMatch extends VoiceMatch {
@@ -271,6 +273,16 @@ class VoiceCommandMatcher {
   static const _readScreen = {'read screen', 'read the screen'};
   static const _readReply = {'read reply', 'read the reply'};
   static const _stopReading = {'stop reading'};
+  static const _readMessage = {
+    'repeat',
+    'repeat that',
+    'repeat message',
+    'repeat the message',
+    'say that again',
+    'say again',
+    'read message',
+    'read the message',
+  };
 
   /// The command each spoken phrase names. A phrase two buttons share at the
   /// same rank (tmux "Split |" and "Split -" are both "split") names neither;
@@ -304,6 +316,9 @@ class VoiceCommandMatcher {
     if (_stopReading.contains(spoken)) return const StopReadingMatch();
     if (_readScreen.contains(spoken)) return const ReadMatch(ReadTarget.screen);
     if (_readReply.contains(spoken)) return const ReadMatch(ReadTarget.reply);
+    if (_readMessage.contains(spoken)) {
+      return const ReadMatch(ReadTarget.message);
+    }
     if (_yes.contains(spoken)) return const YesMatch();
     if (_no.contains(spoken)) return const NoMatch();
     if (_send.contains(spoken)) return const SendMatch();

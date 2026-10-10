@@ -54,5 +54,34 @@ class TerminalComposeTests(unittest.TestCase):
         self.assertFalse(allowed("172.26.64.1", ""))
 
 
+class TerminalSpeakTests(unittest.TestCase):
+    def setUp(self):
+        devota_server.SPEAK_QUEUE.clear()
+
+    def test_a_message_is_handed_over_once_and_may_span_lines(self):
+        sent = devota_server.propose_speech(
+            {"text": " Tests pass.\nShall I push? ", "label": "Claude"}, now=1000)
+        taken = devota_server.take_speech(now=1001)["items"]
+        self.assertEqual([(i["id"], i["text"], i["label"]) for i in taken],
+                         [(sent["id"], "Tests pass.\nShall I push?", "Claude")])
+        self.assertEqual(devota_server.take_speech(now=1002)["items"], [])
+
+    def test_stale_messages_are_dropped(self):
+        devota_server.propose_speech({"text": "old news"}, now=0)
+        devota_server.propose_speech({"text": "fresh"}, now=devota_server.SPEAK_TTL_SECONDS + 1)
+        items = devota_server.take_speech(now=devota_server.SPEAK_TTL_SECONDS + 2)["items"]
+        self.assertEqual([i["text"] for i in items], ["fresh"])
+
+    def test_rejects_empty_and_oversized(self):
+        for bad in ({}, {"text": " "}, {"text": "x" * (devota_server.SPEAK_MAX_CHARS + 1)}):
+            with self.assertRaises(ValueError):
+                devota_server.propose_speech(bad)
+
+    def test_the_speak_route_takes_the_compose_senders(self):
+        source = SERVER_PATH.read_text(encoding="utf-8")
+        route = source.index('if path == "/terminal/speak":')
+        self.assertIn("compose_sender_allowed", source[route:route + 300])
+
+
 if __name__ == "__main__":
     unittest.main()
