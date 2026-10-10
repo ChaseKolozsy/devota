@@ -143,9 +143,9 @@ class _SshTerminalSessionsState extends State<SshTerminalSessions>
         final active = id == profiles.selectedId;
         final ranked = widget.macrosFor == null
             ? null
-            : rankTerminalMacros(widget.macrosFor!(id))
-                  .where((macro) => !macro.isDeviceMacro)
-                  .toList();
+            : rankTerminalMacros(
+                widget.macrosFor!(id),
+              ).where((macro) => !macro.isDeviceMacro).toList();
         final onMacroUsedFor = widget.onMacroUsedFor;
         return SshTerminalTab(
           key: ValueKey('terminal:$id'),
@@ -183,6 +183,7 @@ class _SshTerminalSessionsState extends State<SshTerminalSessions>
           // Only the visible terminal's strip can be dragged, and it shows the
           // selected computer's list, which is the one the reorder edits.
           onMacroReorder: active ? template.onMacroReorder : null,
+          onCommandReorder: active ? template.onCommandReorder : null,
           onZeroTierRecovery: template.onZeroTierRecovery,
           // Forward the test transport to each retained terminal.
           // ignore: invalid_use_of_visible_for_testing_member

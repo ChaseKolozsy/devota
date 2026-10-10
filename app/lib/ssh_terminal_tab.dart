@@ -393,6 +393,7 @@ class SshTerminalTab extends StatefulWidget {
     this.onCommandUsed,
     this.onMacroUsed,
     this.onMacroReorder,
+    this.onCommandReorder,
     this.onZeroTierRecovery,
     this.testHooks,
     this.profileId,
@@ -427,6 +428,10 @@ class SshTerminalTab extends StatefulWidget {
   /// Called when a macro button is held and dragged to a new slot in the macro
   /// bar, with its old and new index in [quickMacros].
   final void Function(int fromIndex, int toIndex)? onMacroReorder;
+
+  /// Called when a saved command is dragged to a new place on the cmds bar,
+  /// with its old and new index in [quickCommands].
+  final void Function(int fromIndex, int toIndex)? onCommandReorder;
 
   @visibleForTesting
   final SshTerminalTestHooks? testHooks;
@@ -2139,22 +2144,32 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     _focusTerminalInput();
   }
 
+  /// A tap on a saved command: it goes straight to the terminal, whatever is
+  /// in the text box (holding it instead puts it in the text box).
   void _runSavedCommand(String command) {
     final trimmed = command.trim();
     if (trimmed.isEmpty || _inputLocked) return;
     widget.onCommandUsed?.call(trimmed);
-    if (_composerController.text.trim().isNotEmpty) {
-      _prefixComposerText(trimmed);
-      setState(() => _status = 'Command prefix inserted.');
-      _focusTerminalInput();
-      return;
-    }
     if (_connected) {
-      _submitTextToTerminal(trimmed);
+      // Straight to the terminal; the text box keeps what was being typed.
+      _writeToSession('$trimmed\n');
+      _focusTerminalInput();
     } else {
       _appendComposerText(trimmed);
       setState(() => _status = 'Command inserted. Connect before submitting.');
     }
+  }
+
+  /// A saved command held and let go: it goes at the front of the text box,
+  /// to be finished there and sent.
+  void _insertSavedCommand(String command) {
+    final trimmed = command.trim();
+    if (trimmed.isEmpty) return;
+    widget.onCommandUsed?.call(trimmed);
+    _prefixComposerText(trimmed);
+    setState(
+      () => _status = 'Command put in the text box: add to it, then send.',
+    );
   }
 
   String? _macroTerminalKeySequence(String value) {
@@ -4407,14 +4422,21 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     );
   }
 
+  // Tap a command to send it to the terminal; hold it and let go to put it
+  // in the text box; hold it and drag to move it.
   Widget _buildCommandContent(ThemeData theme) {
-    return ListView(
+    final commands = widget.quickCommands;
+    final onReorder = widget.onCommandReorder;
+    return MacroReorderableList(
       scrollDirection: Axis.horizontal,
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      children: [
-        for (final command in widget.quickCommands)
-          _terminalCommandButton(command),
-      ],
+      itemCount: commands.length,
+      itemKey: (index) => ValueKey('cmd:$index:${commands[index]}'),
+      onReposition: (from, to) => onReorder?.call(from, to),
+      onHold: (index) {
+        if (_commandBarEnabled) _insertSavedCommand(commands[index]);
+      },
+      itemBuilder: (context, index) => _terminalCommandButton(commands[index]),
     );
   }
 
@@ -4479,6 +4501,8 @@ class _SshTerminalTabState extends State<SshTerminalTab>
       padding: const EdgeInsets.only(right: 6),
       child: Tooltip(
         message: command,
+        // Its own long press would beat the hold gestures; hover still shows.
+        triggerMode: TooltipTriggerMode.manual,
         child: SizedBox(
           height: 32,
           child: OutlinedButton.icon(

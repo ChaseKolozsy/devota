@@ -23,10 +23,7 @@ Future<String> reviewTerminalLocally(String source) async {
 
 /// Common Latin OCR confusions inside counts: "2O/2O", "O failed".
 String normalizeOcrText(String text) => text
-    .replaceAllMapped(
-      RegExp(r'(?<=[\d/])[Oo]|[Oo](?=[\d/])'),
-      (_) => '0',
-    )
+    .replaceAllMapped(RegExp(r'(?<=[\d/])[Oo]|[Oo](?=[\d/])'), (_) => '0')
     .replaceAllMapped(
       RegExp(r'\b[Oo](?=\s+(?:failed|failures?|skipped|unresolved|errors?)\b)'),
       (_) => '0',
@@ -201,28 +198,40 @@ ConclusionVerdict classifyTerminalText(String raw) {
   for (final (offset, sentence) in sentences) {
     final all = _allDone.firstMatch(sentence);
     if (all != null) {
-      return _done('all ${all[1]} ${all[2]!.toLowerCase()}', zero,
-          evidenceAt(offset + all.start));
+      return _done(
+        'all ${all[1]} ${all[2]!.toLowerCase()}',
+        zero,
+        evidenceAt(offset + all.start),
+      );
     }
     final full = _fullCount.firstMatch(sentence);
     if (full != null && full[1] == full[2]) {
-      return _done('${full[1]}/${full[2]} ${full[3]!.toLowerCase()}', zero,
-          evidenceAt(offset + full.start));
+      return _done(
+        '${full[1]}/${full[2]} ${full[3]!.toLowerCase()}',
+        zero,
+        evidenceAt(offset + full.start),
+      );
     }
   }
   final lead = _leadDone.hasMatch(text);
   for (final (offset, sentence) in sentences) {
     final count = _countDone.firstMatch(sentence);
     if (count != null && (zero || lead)) {
-      return _done('${count[1]} ${count[2]!.toLowerCase()}', zero,
-          evidenceAt(offset + count.start));
+      return _done(
+        '${count[1]} ${count[2]!.toLowerCase()}',
+        zero,
+        evidenceAt(offset + count.start),
+      );
     }
   }
   for (final (offset, sentence) in sentences) {
     final general = _generalDone.firstMatch(sentence);
     if (general != null) {
-      return _done('reported complete', zero,
-          evidenceAt(offset + general.start));
+      return _done(
+        'reported complete',
+        zero,
+        evidenceAt(offset + general.start),
+      );
     }
   }
   return ConclusionVerdict.unknown;
@@ -293,8 +302,10 @@ List<String>? _reportLines(String raw) {
       .where(
         (line) =>
             line.trim().isNotEmpty &&
-            !RegExp(r'^\s*(?:⏵⏵|⏸|✔ Update installed|\? for shortcuts|'
-                    r'← for agents)').hasMatch(line),
+            !RegExp(
+              r'^\s*(?:⏵⏵|⏸|✔ Update installed|\? for shortcuts|'
+              r'← for agents)',
+            ).hasMatch(line),
       )
       .toList();
 }

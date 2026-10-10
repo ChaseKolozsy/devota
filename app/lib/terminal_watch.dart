@@ -232,6 +232,7 @@ class TerminalWatchController extends ChangeNotifier {
   bool reviewEnabled = true;
   bool autoRunEnabled = true;
   Duration autoRunDelay = const Duration(seconds: 10);
+
   /// Recent completed-run durations in seconds, per macro ID, newest last.
   Map<String, List<int>> macroDurations = {};
   void Function(Map<String, List<int>> durations)? onDurationsChanged;
@@ -414,8 +415,21 @@ class TerminalWatchController extends ChangeNotifier {
 
   bool _autoChecking = false;
   static const _shells = {
-    'bash', 'zsh', 'sh', 'dash', 'fish', 'ksh', 'tcsh', 'csh', 'login',
-    'pwsh', 'powershell', 'cmd', 'cmd.exe', 'powershell.exe', 'pwsh.exe',
+    'bash',
+    'zsh',
+    'sh',
+    'dash',
+    'fish',
+    'ksh',
+    'tcsh',
+    'csh',
+    'login',
+    'pwsh',
+    'powershell',
+    'cmd',
+    'cmd.exe',
+    'powershell.exe',
+    'pwsh.exe',
   };
 
   /// Confirms an agent is still the pane's foreground program; a macro prompt
@@ -435,7 +449,10 @@ class TerminalWatchController extends ChangeNotifier {
     }
   }
 
-  Future<void> _autoRun(TerminalWatchBinding binding, PaneObservation state) async {
+  Future<void> _autoRun(
+    TerminalWatchBinding binding,
+    PaneObservation state,
+  ) async {
     _autoChecking = true;
     final expected = token(binding);
     String? problem;

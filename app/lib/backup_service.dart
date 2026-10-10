@@ -36,6 +36,7 @@ class BackupService {
     'terminal_pad_config_json',
   ];
   static const _boolPreferenceKeys = [
+    'commands_arranged',
     'agent_whole_device',
     'computer_profiles_migrated',
     'ssh_use_private_key',

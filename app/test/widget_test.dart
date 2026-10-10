@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:dio/dio.dart';
@@ -41,9 +42,11 @@ void main() {
     expect(find.text('DevOTA'), findsOneWidget);
   });
 
-  testWidgets('saved terminal command prefixes existing composer text', (
-    WidgetTester tester,
-  ) async {
+  Future<List<String>> pumpCommands(
+    WidgetTester tester, {
+    void Function(int, int)? onReorder,
+  }) async {
+    final sent = <String>[];
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
@@ -52,23 +55,88 @@ void main() {
             height: 700,
             child: SshTerminalTab(
               dio: Dio(),
-              serverUrl: 'http://127.0.0.1:8082',
-              quickCommands: const ['plan'],
+              serverUrl: '',
+              quickCommands: const ['plan', 'review'],
+              onCommandReorder: onReorder,
+              testHooks: SshTerminalTestHooks(sessionSink: sent.add),
             ),
           ),
         ),
       ),
     );
     await tester.pump();
+    return sent;
+  }
 
-    final composer = find.byType(TextField);
-    await tester.enterText(composer, 'summarize what I just said');
+  String composerText(WidgetTester tester) => tester
+      .widget<TextField>(
+        find.byWidgetPredicate(
+          (w) => w is TextField && w.decoration?.hintText == 'Type command',
+        ),
+      )
+      .controller!
+      .text;
+
+  testWidgets('tapping a saved command sends it, whatever is in the text box', (
+    WidgetTester tester,
+  ) async {
+    final sent = await pumpCommands(tester);
+    await tester.enterText(find.byType(TextField), 'half-typed thought');
     await tester.tap(find.text('plan'));
     await tester.pump();
-
-    final textField = tester.widget<TextField>(composer);
-    expect(textField.controller?.text, 'plan summarize what I just said');
+    expect(sent, ['plan\n']);
+    expect(composerText(tester), 'half-typed thought');
     await tester.pump(const Duration(milliseconds: 300));
+  });
+
+  testWidgets(
+    'holding a saved command and letting go puts it in the text box',
+    (WidgetTester tester) async {
+      final sent = await pumpCommands(tester);
+      await tester.enterText(
+        find.byType(TextField),
+        'summarize what I just said',
+      );
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.text('plan')),
+      );
+      await tester.pump(kLongPressTimeout + const Duration(milliseconds: 50));
+      await gesture.up();
+      await tester.pumpAndSettle();
+      expect(sent, isEmpty);
+      expect(composerText(tester), 'plan summarize what I just said');
+    },
+  );
+
+  testWidgets('holding a saved command and dragging it moves it', (
+    WidgetTester tester,
+  ) async {
+    final moves = <int>[];
+    final sent = await pumpCommands(
+      tester,
+      onReorder: (from, to) => moves.addAll([from, to]),
+    );
+    final start = tester.getCenter(find.text('review'));
+    final target = tester.getCenter(find.text('plan'));
+    final gesture = await tester.startGesture(start);
+    var elapsed = kLongPressTimeout + const Duration(milliseconds: 20);
+    await tester.pump(elapsed);
+    const steps = 10;
+    for (var i = 0; i < steps; i++) {
+      elapsed += const Duration(milliseconds: 60);
+      await gesture.moveBy(
+        Offset((target.dx - start.dx - 30) / steps, 0),
+        timeStamp: elapsed,
+      );
+      await tester.pump(const Duration(milliseconds: 60));
+    }
+    elapsed += const Duration(milliseconds: 300);
+    await tester.pump(const Duration(milliseconds: 300));
+    await gesture.up(timeStamp: elapsed);
+    await tester.pumpAndSettle();
+    expect(moves, [1, 0]);
+    expect(sent, isEmpty);
+    expect(composerText(tester), isEmpty);
   });
 
   testWidgets('control pad shows default keys and opens customization sheet', (

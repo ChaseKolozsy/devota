@@ -335,24 +335,54 @@ const Map<String, _NamedKey> _kNamedKeys = {
 
 // Canonical display names for the keys above (first alias wins).
 const Map<String, String> _kNamedDisplay = {
-  'tab': 'Tab', 'enter': 'Enter', 'return': 'Enter', 'esc': 'Esc',
-  'escape': 'Esc', 'backspace': 'Backspace', 'bksp': 'Backspace',
-  'del': 'Del', 'delete': 'Del', 'ins': 'Ins',
-  'insert': 'Ins', 'home': 'Home', 'end': 'End', 'pgup': 'PgUp',
-  'pageup': 'PgUp', 'pgdn': 'PgDn', 'pagedown': 'PgDn', 'up': 'Up',
-  'down': 'Down', 'right': 'Right', 'left': 'Left',
+  'tab': 'Tab',
+  'enter': 'Enter',
+  'return': 'Enter',
+  'esc': 'Esc',
+  'escape': 'Esc',
+  'backspace': 'Backspace',
+  'bksp': 'Backspace',
+  'del': 'Del',
+  'delete': 'Del',
+  'ins': 'Ins',
+  'insert': 'Ins',
+  'home': 'Home',
+  'end': 'End',
+  'pgup': 'PgUp',
+  'pageup': 'PgUp',
+  'pgdn': 'PgDn',
+  'pagedown': 'PgDn',
+  'up': 'Up',
+  'down': 'Down',
+  'right': 'Right',
+  'left': 'Left',
 };
 
 // Ctrl + these punctuation characters map to specific control codes.
 const Map<String, String> _kCtrlPunct = {
-  '@': '\x00', ' ': '\x00', '[': '\x1B', '\\': '\x1C', ']': '\x1D',
-  '^': '\x1E', '_': '\x1F', '?': '\x7F',
+  '@': '\x00',
+  ' ': '\x00',
+  '[': '\x1B',
+  '\\': '\x1C',
+  ']': '\x1D',
+  '^': '\x1E',
+  '_': '\x1F',
+  '?': '\x7F',
 };
 
 const Map<int, String> _kFnKeys = {
-  1: '\x1BOP', 2: '\x1BOQ', 3: '\x1BOR', 4: '\x1BOS',
-  5: '\x1B[15~', 6: '\x1B[17~', 7: '\x1B[18~', 8: '\x1B[19~',
-  9: '\x1B[20~', 10: '\x1B[21~', 11: '\x1B[23~', 12: '\x1B[24~',
+  1: '\x1BOP',
+  2: '\x1BOQ',
+  3: '\x1BOR',
+  4: '\x1BOS',
+  5: '\x1B[15~',
+  6: '\x1B[17~',
+  7: '\x1B[18~',
+  8: '\x1B[19~',
+  9: '\x1B[20~',
+  10: '\x1B[21~',
+  11: '\x1B[23~',
+  12: '\x1B[24~',
 };
 
 /// Resolves a human-friendly key spec into the bytes to send. Accepts one or
@@ -453,7 +483,10 @@ KeySpecResult _resolveKeyToken(String token) {
     if (ctrl || alt || shift) {
       return KeySpecResult.err('Modifiers on F-keys are not supported.');
     }
-    return KeySpecResult.ok(_kFnKeys[int.parse(fMatch.group(1)!)]!, base.toUpperCase());
+    return KeySpecResult.ok(
+      _kFnKeys[int.parse(fMatch.group(1)!)]!,
+      base.toUpperCase(),
+    );
   }
 
   // Shift-Tab has its own sequence.
@@ -499,7 +532,11 @@ KeySpecResult _resolveKeyToken(String token) {
 }
 
 // Modifier value per the xterm/CSI convention: 1 + shift + 2*alt + 4*ctrl.
-int _modifierValue({required bool ctrl, required bool alt, required bool shift}) {
+int _modifierValue({
+  required bool ctrl,
+  required bool alt,
+  required bool shift,
+}) {
   return 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0);
 }
 
@@ -543,11 +580,7 @@ String? _resolveCharKey(
 }
 
 String _describeCombo(bool ctrl, bool alt, bool shift) {
-  final mods = <String>[
-    if (ctrl) 'Ctrl',
-    if (alt) 'Alt',
-    if (shift) 'Shift',
-  ];
+  final mods = <String>[if (ctrl) 'Ctrl', if (alt) 'Alt', if (shift) 'Shift'];
   return mods.isEmpty ? '' : '${mods.join('-')}-';
 }
 

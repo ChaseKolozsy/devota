@@ -108,6 +108,7 @@ class MacroReorderableList extends StatefulWidget {
     this.padding,
     this.onRepositionStart,
     this.onRepositionEnd,
+    this.onHold,
   });
 
   final int itemCount;
@@ -125,12 +126,38 @@ class MacroReorderableList extends StatefulWidget {
   final ValueChanged<int>? onRepositionStart;
   final ValueChanged<int>? onRepositionEnd;
 
+  /// An item held and let go without moving: a third gesture beside the tap
+  /// and the hold-and-drag (the command strip puts the command in the text
+  /// box). A pick-up only becomes a move once the finger travels.
+  final ValueChanged<int>? onHold;
+
   @override
   State<MacroReorderableList> createState() => _MacroReorderableListState();
 }
 
+/// How far a held item may wander and still count as held in place.
+const double macroHoldSlop = 12;
+
 class _MacroReorderableListState extends State<MacroReorderableList> {
   late final _dragVelocity = MacroDragVelocityTracker(widget.scrollDirection);
+  Offset? _downAt;
+  double _travel = 0;
+  int? _pickedUp;
+
+  void _onPointerDown(PointerDownEvent event) {
+    _downAt = event.position;
+    _travel = 0;
+    _dragVelocity.onPointerDown(event);
+  }
+
+  void _onPointerMove(PointerMoveEvent event) {
+    final start = _downAt;
+    if (start != null) {
+      final distance = (event.position - start).distance;
+      if (distance > _travel) _travel = distance;
+    }
+    _dragVelocity.onPointerMove(event);
+  }
 
   Widget _liftedItem(Widget child, int index, Animation<double> animation) {
     return AnimatedBuilder(
@@ -155,8 +182,8 @@ class _MacroReorderableListState extends State<MacroReorderableList> {
   @override
   Widget build(BuildContext context) {
     return Listener(
-      onPointerDown: _dragVelocity.onPointerDown,
-      onPointerMove: _dragVelocity.onPointerMove,
+      onPointerDown: _onPointerDown,
+      onPointerMove: _onPointerMove,
       onPointerUp: _dragVelocity.onPointerUp,
       onPointerCancel: _dragVelocity.onPointerCancel,
       child: ReorderableListView.builder(
@@ -168,9 +195,17 @@ class _MacroReorderableListState extends State<MacroReorderableList> {
         proxyDecorator: _liftedItem,
         onReorderStart: (index) {
           _confirmPickUp();
+          _pickedUp = index;
           widget.onRepositionStart?.call(index);
         },
-        onReorderEnd: (index) => widget.onRepositionEnd?.call(index),
+        onReorderEnd: (index) {
+          final held = _pickedUp;
+          _pickedUp = null;
+          widget.onRepositionEnd?.call(index);
+          if (held != null && _travel <= macroHoldSlop) {
+            widget.onHold?.call(held);
+          }
+        },
         itemCount: widget.itemCount,
         itemBuilder: (context, index) => ReorderableDelayedDragStartListener(
           key: widget.itemKey(index),
@@ -178,6 +213,7 @@ class _MacroReorderableListState extends State<MacroReorderableList> {
           child: widget.itemBuilder(context, index),
         ),
         onReorderItem: (oldIndex, newIndex) {
+          if (_travel <= macroHoldSlop) return; // held in place, not moved
           final target = resolveMacroDropIndex(
             newIndex: newIndex,
             itemCount: widget.itemCount,

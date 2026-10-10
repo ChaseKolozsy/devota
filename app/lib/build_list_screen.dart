@@ -393,9 +393,36 @@ class _BuildListScreenState extends State<BuildListScreen>
         _commandUseCounts = {};
       }
     }
-    if (saved != null && mounted) {
-      setState(() => _commands = saved);
+    final arranged = prefs.getBool(_commandsArrangedKey) ?? false;
+    if (mounted) {
+      setState(() {
+        if (saved != null) _commands = saved;
+        _commandsArranged = arranged;
+      });
     }
+  }
+
+  /// Set once a command has been dragged into place on the terminal's cmds
+  /// bar: from then on the bar keeps that order instead of ranking by use.
+  static const _commandsArrangedKey = 'commands_arranged';
+  bool _commandsArranged = false;
+
+  void _repositionQuickCommand(int fromIndex, int toIndex) {
+    final ranked = _rankedCommands;
+    final quick = ranked.take(quickCommandCount).length;
+    if (fromIndex < 0 || fromIndex >= quick) return;
+    final target = toIndex.clamp(0, quick - 1);
+    if (target == fromIndex) return;
+    ranked.insert(target, ranked.removeAt(fromIndex));
+    setState(() {
+      _commands = ranked;
+      _commandsArranged = true;
+    });
+    unawaited(() async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_commandsArrangedKey, true);
+      await _saveCommands();
+    }());
   }
 
   Future<void> _saveCommands() async {
@@ -409,6 +436,7 @@ class _BuildListScreenState extends State<BuildListScreen>
   }
 
   List<String> get _rankedCommands {
+    if (_commandsArranged) return List.of(_commands);
     final indexed = _commands.asMap().entries.toList();
     indexed.sort((a, b) {
       final usage = (_commandUseCounts[b.value] ?? 0).compareTo(
@@ -420,7 +448,10 @@ class _BuildListScreenState extends State<BuildListScreen>
     return indexed.map((entry) => entry.value).toList();
   }
 
-  List<String> get _quickCommands => _rankedCommands.take(12).toList();
+  static const quickCommandCount = 12;
+
+  List<String> get _quickCommands =>
+      _rankedCommands.take(quickCommandCount).toList();
 
   void _addCommand() {
     final text = _commandController.text.trim();
@@ -704,11 +735,10 @@ class _BuildListScreenState extends State<BuildListScreen>
 
   List<TerminalMacro> get _rankedMacros => rankTerminalMacros(_macros);
 
-  List<TerminalMacro> get _quickMacros =>
-      _rankedMacros
-          .where((macro) => !macro.isDeviceMacro)
-          .take(quickTerminalMacroCount)
-          .toList();
+  List<TerminalMacro> get _quickMacros => _rankedMacros
+      .where((macro) => !macro.isDeviceMacro)
+      .take(quickTerminalMacroCount)
+      .toList();
 
   bool get _anyMacroRunning =>
       _deviceMacroRunning || _macroController.isRunning;
@@ -2001,6 +2031,7 @@ class _BuildListScreenState extends State<BuildListScreen>
             onCommandUsed: _recordCommandUse,
             onMacroUsed: _recordMacroUse,
             onMacroReorder: _repositionQuickMacro,
+            onCommandReorder: _repositionQuickCommand,
             onZeroTierRecovery:
                 _macros.any(
                   (macro) =>

@@ -89,7 +89,9 @@ class TerminalNotificationBridge {
       final reader =
           _bridges.where((bridge) => bridge._reading != null).firstOrNull ??
           _activeOwner;
-      if (reader != null) unawaited(reader._readerAction(args['action'] as String));
+      if (reader != null) {
+        unawaited(reader._readerAction(args['action'] as String));
+      }
       return;
     }
     if (call.method != 'action') return;
@@ -125,9 +127,7 @@ class TerminalNotificationBridge {
     } else if (action == 'autoStop') {
       watch.stopAutoRun(paneId);
     } else {
-      unawaited(
-        watch.act(paneId, action as String, args['token'] as String),
-      );
+      unawaited(watch.act(paneId, action as String, args['token'] as String));
     }
   }
 
@@ -289,9 +289,7 @@ class TerminalNotificationBridge {
       (bridge) => bridge.enabled && bridge.watch.bindings.isNotEmpty,
     );
     final named = contributing.length > 1;
-    final cards = [
-      for (final bridge in live) ...bridge._cards(named: named),
-    ];
+    final cards = [for (final bridge in live) ...bridge._cards(named: named)];
     final version = ++_publishVersion;
     void report(String status) {
       for (final bridge in live) {

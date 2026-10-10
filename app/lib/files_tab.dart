@@ -73,7 +73,8 @@ class _FilesTabState extends State<FilesTab> {
   Future<void> _download(Map<String, dynamic> file) async {
     final name = file['name'] as String?;
     if (name == null || _downloadProgress.containsKey(name)) return;
-    final mimeType = (file['contentType'] as String?) ?? 'application/octet-stream';
+    final mimeType =
+        (file['contentType'] as String?) ?? 'application/octet-stream';
 
     setState(() => _downloadProgress[name] = 0);
     try {
@@ -183,9 +184,9 @@ class _FilesTabState extends State<FilesTab> {
 
       if (!mounted) return;
       setState(() => _downloadProgress.remove(name));
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Extracted to $savedLabel')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Extracted to $savedLabel')));
     } catch (e) {
       if (!mounted) return;
       setState(() => _downloadProgress.remove(name));
@@ -299,7 +300,7 @@ class _FilesTabState extends State<FilesTab> {
           child: Text(
             _serverDir == null
                 ? 'Agents can drop files into the build server’s file-transfer '
-                    'directory (or POST /files/upload). They show up here to download.'
+                      'directory (or POST /files/upload). They show up here to download.'
                 : 'Drop files into:\n$_serverDir',
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,

@@ -3376,7 +3376,7 @@ def make_handler(repo_root: Path, manifest_path: Path, manifest: dict[str, Any])
                 {
                     **public_app(app),
                     "buildCount": len(by_app.get(app["id"], [])),
-                    "latestBuild": by_app.get(app["id"], [None])[0],
+                    "latestBuild": (by_app.get(app["id"]) or [None])[0],
                 }
                 for app in manifest["apps"]
             ]
