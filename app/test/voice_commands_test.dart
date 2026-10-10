@@ -63,6 +63,14 @@ void main() {
     expect(idOf('next window'), 'tmux_next');
   });
 
+  test('number words read as digits', () {
+    expect(numbersAsDigits('window zero'), 'window 0');
+    expect(numbersAsDigits('go to line twenty five'), 'go to line 25');
+    expect(numbersAsDigits('line one hundred and five'), 'line 105');
+    expect(numbersAsDigits('page up'), 'page up');
+    expect(numbersAsDigits('back to the top'), 'back to the top');
+  });
+
   test('a command must be the whole utterance', () {
     for (final said in [
       'please press page up',

@@ -169,6 +169,31 @@ void main() {
     await settle(tester);
   });
 
+  testWidgets('windows by number word, and scroll to top and bottom', (
+    tester,
+  ) async {
+    await pumpTab(tester);
+    await toggleOn(tester);
+    final expected = {
+      'window zero': '\x02' '0',
+      'Window 3': '\x02' '3',
+      'switch to window two': '\x02' '2',
+      'go to window five': '\x02' '5',
+      'previous': '\x02p',
+      'next window': '\x02n',
+      'scroll to the top': '\x02:copy-mode ; send -X history-top\r',
+      'jump to bottom': "\x02:if -F '#{pane_in_mode}' 'send -X cancel'\r",
+    };
+    for (final entry in expected.entries) {
+      writes.clear();
+      final reply = await say(tester, entry.key);
+      expect(reply?['tone'], 'command', reason: entry.key);
+      expect(writes, [entry.value], reason: entry.key);
+    }
+    expect(composer(tester), isEmpty);
+    await settle(tester);
+  });
+
   testWidgets('tmux row commands run the tmux buttons', (tester) async {
     await pumpTab(tester);
     await toggleOn(tester);

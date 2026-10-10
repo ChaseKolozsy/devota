@@ -27,9 +27,14 @@ class VoiceTarget {
     this.abbreviation,
     this.enabled = true,
     this.confirm = false,
+    this.aliases = const [],
   });
 
   final VoiceTargetKind kind;
+
+  /// Other things a person says for it ("previous" for Prev), heard like the
+  /// tooltip.
+  final List<String> aliases;
 
   /// Pad key id, arrow id, tmux usage id, macro id, or the command text.
   final String id;
@@ -65,6 +70,9 @@ class VoiceTarget {
     }
 
     add(label, 0);
+    for (final alias in aliases) {
+      add(alias, 1);
+    }
     switch (kind) {
       case VoiceTargetKind.padKey:
         add(abbreviation, 1);
@@ -305,6 +313,65 @@ class DictationMatch extends VoiceMatch {
   final String text;
 }
 
+const _numberWords = {
+  'zero',
+  'one',
+  'two',
+  'three',
+  'four',
+  'five',
+  'six',
+  'seven',
+  'eight',
+  'nine',
+  'ten',
+  'eleven',
+  'twelve',
+  'thirteen',
+  'fourteen',
+  'fifteen',
+  'sixteen',
+  'seventeen',
+  'eighteen',
+  'nineteen',
+  'twenty',
+  'thirty',
+  'forty',
+  'fifty',
+  'sixty',
+  'seventy',
+  'eighty',
+  'ninety',
+  'hundred',
+};
+
+/// [spoken] with each run of number words written as digits, so "window
+/// zero" names the button labelled 0 and "line twenty five" is line 25.
+String numbersAsDigits(String spoken) {
+  final words = spoken.split(' ');
+  final out = <String>[];
+  var i = 0;
+  while (i < words.length) {
+    if (!_numberWords.contains(words[i])) {
+      out.add(words[i++]);
+      continue;
+    }
+    var end = i + 1;
+    while (end < words.length &&
+        (_numberWords.contains(words[end]) ||
+            (words[end] == 'and' &&
+                end + 1 < words.length &&
+                _numberWords.contains(words[end + 1])))) {
+      end++;
+    }
+    final run = words.sublist(i, end);
+    final n = run.length == 1 && run.single == 'zero' ? 0 : parseCount(run);
+    out.add(n == null ? run.join(' ') : '$n');
+    i = end;
+  }
+  return out.join(' ');
+}
+
 /// Decides what one whole utterance is.
 class VoiceCommandMatcher {
   const VoiceCommandMatcher();
@@ -384,11 +451,27 @@ class VoiceCommandMatcher {
     if (_send.contains(spoken)) return const SendMatch();
     final edit = _composerEdit(spoken);
     if (edit != null) return edit;
-    final target = vocabulary(targets)[spoken];
+    final target = _named(vocabulary(targets), spoken);
     if (target != null) return TargetMatch(target);
     return mode == VoiceMode.commands
         ? NotACommandMatch(text)
         : DictationMatch(text);
+  }
+
+  /// The button [spoken] names: as heard, with numbers as digits, and
+  /// without a leading "go to" / "switch to" ("switch to window two").
+  VoiceTarget? _named(Map<String, VoiceTarget> names, String spoken) {
+    for (final candidate in [spoken, numbersAsDigits(spoken)]) {
+      final hit = names[candidate];
+      if (hit != null) return hit;
+      for (final lead in const ['go to ', 'switch to ']) {
+        if (candidate.startsWith(lead)) {
+          final rest = names[candidate.substring(lead.length)];
+          if (rest != null) return rest;
+        }
+      }
+    }
+    return null;
   }
 
   ComposerEditMatch? _composerEdit(String spoken) {

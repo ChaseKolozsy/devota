@@ -2028,6 +2028,38 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     }
   }
 
+  static const _tmuxVoiceAliases = <String, List<String>>{
+    'tmux_prev': ['previous', 'last window'],
+    'tmux_new': ['new window'],
+  };
+
+  /// The oldest line tmux kept: scroll mode, then history-top, through the
+  /// command prompt so it works with vi and emacs copy-mode keys alike.
+  void _tmuxScrollToTop() {
+    _sendTerminalKey('\x02:copy-mode ; send -X history-top\r');
+    _hideTerminalKeyboard();
+    _resetTerminalScrollGestures();
+    if (mounted) {
+      setState(() {
+        _tmuxScrollMode = true;
+        _status =
+            'tmux scroll mode, at the top: say scroll to bottom to leave.';
+      });
+    }
+  }
+
+  /// Back to the live screen: leaves scroll mode if tmux is in it.
+  void _tmuxScrollToBottom() {
+    _sendTerminalKey("\x02:if -F '#{pane_in_mode}' 'send -X cancel'\r");
+    _resetTerminalScrollGestures();
+    if (mounted) {
+      setState(() {
+        _tmuxScrollMode = false;
+        _status = 'Back at the bottom.';
+      });
+    }
+  }
+
   void _enterTmuxScrollMode() {
     _sendTmuxCommand('[');
     _hideTerminalKeyboard();
@@ -2838,9 +2870,29 @@ class _SshTerminalTabState extends State<SshTerminalTab>
         id: button.id,
         label: button.label,
         tooltip: button.tooltip,
+        aliases: _tmuxVoiceAliases[button.id] ?? const [],
         enabled: _tmuxBarEnabled,
         run: _tmuxTap(button),
       ),
+    // Voice only: no button, since a tap on Scroll and Page Up does the same.
+    VoiceTarget(
+      kind: VoiceTargetKind.tmux,
+      id: 'tmux_scroll_top',
+      label: 'Scroll to top',
+      aliases: const ['scroll to the top', 'jump to top', 'jump to the top'],
+      run: _tmuxScrollToTop,
+    ),
+    VoiceTarget(
+      kind: VoiceTargetKind.tmux,
+      id: 'tmux_scroll_bottom',
+      label: 'Scroll to bottom',
+      aliases: const [
+        'scroll to the bottom',
+        'jump to bottom',
+        'jump to the bottom',
+      ],
+      run: _tmuxScrollToBottom,
+    ),
     for (final macro in widget.quickMacros)
       VoiceTarget(
         kind: VoiceTargetKind.macro,
