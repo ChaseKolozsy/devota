@@ -444,6 +444,45 @@ with the token the server writes, readable only by its user, to
 `<repo-root>/.devota-cache/compose-token`; `devota-compose` and the MCP tool
 read it from there (or from `DEVOTA_COMPOSE_TOKEN`).
 
+## Voice control
+
+The outlined mic in the Terminal tab's top bar turns voice control on. Every
+utterance acts on the terminal on screen, through the same handlers its
+buttons use. A command must be the whole utterance ("page up" is a command,
+"scroll the page up a bit" is dictation).
+
+- **Buttons by name**, even with the tools collapsed: every pad key ("page
+  up", "backspace", "enter", "escape", custom keys), the arrows ("up arrow"),
+  the tmux row ("next window", "previous", "new window", "window zero" …
+  "window five", "go to" / "switch to window two"), macros and cmds.
+- **Scrolling**: "scroll to top" / "jump to top" opens tmux scroll mode at the
+  oldest line; "scroll to bottom" returns to the live screen.
+- **The text box**: "send", "clear", "backspace 5", "delete 3 words".
+- **Symbols while dictating**, by names nobody says in a sentence: "open
+  paren" / "close paren", "open bracket", "open curly brace", "open quote",
+  "underscore", "hyphen", "dot", "forward slash", "backslash", "colon",
+  "semicolon", "equals sign", "plus sign", "dollar sign", "at sign", "pipe
+  symbol", "ampersand", "asterisk", "question mark" …. "print open paren x
+  close paren" types `print(x)`. "Dash", "period", "comma" and "quote" stay
+  words.
+- **Reading aloud**: "read reply" (the agent's latest answer, Claude Code and
+  Codex recognized), "read screen", "repeat" (the last agent message), "stop
+  reading".
+- **Modes**, switched by nonsense phrases so dictation never switches by
+  accident (editable in the session settings):
+  - "wobble wobble": transcription — everything is typed, except the mode
+    phrases, "stop listening", "stop reading", "send" and the text-box edits;
+  - "noodle noodle": commands only — anything that is not a command is ignored;
+  - "jelly jelly": mixed, the default — commands act, the rest is typed.
+- **Vim** ("vim mode" / "vim off"): "go to line 25", "top", "bottom",
+  "beginning of line", "end of line", "next word", "previous word", "down five
+  lines", "matching paren", "undo", "redo", "insert", "append", "new line
+  below", "delete line", "copy line", "paste", "search for <text>", "find
+  next", "save", "save and quit", "quit", "quit without saving" (asks yes).
+  Each starts with Ctrl-\ Ctrl-N (to Normal mode), not Escape, which tmux
+  would merge with the next key into Alt+key. Plain "up" / "down" stay arrows.
+- "stop listening" turns voice control off.
+
 ## Messages spoken on the phone
 
 An agent can talk to the person instead of printing for them — progress,
