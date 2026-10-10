@@ -19,6 +19,7 @@ import 'background_session_service.dart';
 import 'macro_reorder.dart';
 import 'macro_sync_service.dart';
 import 'openai_key_dialog.dart';
+import 'terminal_compose_inbox.dart';
 import 'terminal_macro.dart';
 import 'terminal_submission.dart';
 import 'terminal_watch.dart';
@@ -570,11 +571,13 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     _attachMacroController();
     _watch.addListener(_onWatchChanged);
     _notificationBridge.publish();
+    _startComposeInbox();
   }
 
   @override
   void dispose() {
     _disposing = true;
+    _composeInboxTimer?.cancel();
     _voiceSession.removeListener(_onVoiceChanged);
     _voiceSession.dispose();
     _watch.removeListener(_onWatchChanged);
@@ -619,6 +622,7 @@ class _SshTerminalTabState extends State<SshTerminalTab>
       }
       unawaited(_syncBackgroundSession());
     }
+    if (oldWidget.serverUrl != widget.serverUrl) _startComposeInbox();
     if (oldWidget.macroController != widget.macroController) {
       oldWidget.macroController?.detach(owner: this);
       _attachMacroController();
@@ -2039,6 +2043,66 @@ class _SshTerminalTabState extends State<SshTerminalTab>
     _composerController.value = TextEditingValue(
       text: next,
       selection: TextSelection.collapsed(offset: start + text.length),
+    );
+  }
+
+  Timer? _composeInboxTimer;
+  bool _composeInboxBusy = false;
+  static const _composeInboxInterval = Duration(seconds: 3);
+
+  /// Watches this computer's DevOTA server for commands an agent proposes
+  /// (`POST /terminal/compose`), so they land in this terminal's text box.
+  void _startComposeInbox() {
+    _composeInboxTimer?.cancel();
+    _composeInboxTimer = null;
+    if (widget.serverUrl.trim().isEmpty) return;
+    _composeInboxTimer = Timer.periodic(
+      _composeInboxInterval,
+      (_) => unawaited(_checkComposeInbox()),
+    );
+  }
+
+  Future<void> _checkComposeInbox() async {
+    if (_composeInboxBusy || _disposing) return;
+    _composeInboxBusy = true;
+    try {
+      final commands = await TerminalComposeInbox.take(
+        widget.dio,
+        widget.serverUrl,
+      );
+      if (!mounted || _disposing || commands.isEmpty) return;
+      _receiveProposedCommands(commands);
+    } catch (_) {
+      // An unreachable server just means nothing arrives until it is back.
+    } finally {
+      _composeInboxBusy = false;
+    }
+  }
+
+  /// Puts the newest proposed command in the text box. Nothing is sent: the
+  /// person reads it and presses send (or clears it).
+  @visibleForTesting
+  void receiveProposedCommands(List<ProposedCommand> commands) =>
+      _receiveProposedCommands(commands);
+
+  void _receiveProposedCommands(List<ProposedCommand> commands) {
+    final command = commands.last;
+    _composerController.text = command.text;
+    _composerController.selection = TextSelection.fromPosition(
+      TextPosition(offset: _composerController.text.length),
+    );
+    final from = command.label.isEmpty ? 'An agent' : command.label;
+    final more = commands.length > 1 ? ' (newest of ${commands.length})' : '';
+    setState(
+      () => _status = '$from sent a command$more: check it, then press send.',
+    );
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(
+        content: Text(
+          'Command ready in the ${_notificationLabel()} terminal: '
+          'check it, then press send.',
+        ),
+      ),
     );
   }
 

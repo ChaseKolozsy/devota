@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Put a command in the DevOTA phone's terminal text box for this computer.
+
+The phone shows it in the text box of this computer's terminal; nothing runs
+until the person presses send.
+
+    scripts/devota-compose 'gh auth status'
+    scripts/devota-compose --server http://127.0.0.1:8004 --label Claude 'ls'
+
+Sending from this machine over 127.0.0.1 needs nothing else. Any other route
+(a LAN/VPN address, a port proxy) needs the server's token: it is read from
+$DEVOTA_COMPOSE_TOKEN, else from <repo-root>/.devota-cache/compose-token.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("text", help="one shell command")
+    parser.add_argument("--server", default=os.environ.get("DEVOTA_SERVER_URL", "http://127.0.0.1:8082"),
+                        help="this computer's DevOTA server (default $DEVOTA_SERVER_URL or http://127.0.0.1:8082)")
+    parser.add_argument("--label", default=os.environ.get("DEVOTA_COMPOSE_LABEL", "Agent"),
+                        help="who is sending it, shown on the phone")
+    parser.add_argument("--repo-root", default=os.environ.get("DEVOTA_REPO_ROOT", str(Path(__file__).resolve().parent.parent)),
+                        help="the server's --repo-root, where its token lives")
+    args = parser.parse_args()
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("DEVOTA_COMPOSE_TOKEN", "").strip()
+    if not token:
+        try:
+            token = (Path(args.repo_root) / ".devota-cache" / "compose-token").read_text(encoding="utf-8").strip()
+        except OSError:
+            token = ""
+    if token:
+        headers["X-DevOTA-Compose-Token"] = token
+    request = urllib.request.Request(
+        args.server.rstrip("/") + "/terminal/compose",
+        data=json.dumps({"text": args.text, "label": args.label}).encode(),
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            sent = json.load(response)
+    except urllib.error.HTTPError as exc:
+        print(f"devota-compose: HTTP {exc.code}: {exc.reason}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"devota-compose: cannot reach {args.server}: {exc.reason}", file=sys.stderr)
+        return 1
+    print(f"Sent (#{sent['id']}); it appears in the phone's text box within a few seconds.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

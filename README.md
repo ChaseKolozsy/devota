@@ -421,3 +421,26 @@ A resolver is a Python file defining `resolve_macro(macro)`. It receives a
 validated copy of the macro and returns it with its own placeholders replaced,
 or `None` when the macro holds none of them.
 
+## Commands from an agent
+
+An agent working on a computer can hand the person at the phone a command to
+run, without being able to run it: the command appears in the text box of
+that computer's DevOTA terminal, and nothing happens until the person presses
+send (or clears it with the ✕).
+
+```bash
+scripts/devota-compose 'gh auth status'                       # this computer's server, :8082
+scripts/devota-compose --server http://127.0.0.1:8004 --label Claude 'ls'
+```
+
+MCP agents use the `devota_terminal_compose` tool. The server (`POST
+/terminal/compose`, one line, up to 4000 characters) keeps each command in
+memory for 30 minutes and hands it to the phone once; each terminal in the app
+checks its own computer's server every 3 seconds (`GET /terminal/compose`).
+A sender on this machine reaching the server over 127.0.0.1 needs nothing
+else. Any other route (a LAN or VPN address, a port proxy, which makes every
+sender look like the proxy host) must send the header `X-DevOTA-Compose-Token`
+with the token the server writes, readable only by its user, to
+`<repo-root>/.devota-cache/compose-token`; `devota-compose` and the MCP tool
+read it from there (or from `DEVOTA_COMPOSE_TOKEN`).
+

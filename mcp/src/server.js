@@ -5,6 +5,7 @@ import { z } from "zod";
 import { WebSocketServer } from "ws";
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import fs from "node:fs";
 import { chmod, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -111,6 +112,20 @@ function requireBuildServerUrl() {
     throw new Error("DEVOTA_BUILD_SERVER_URL is required for DevOTA build-server tools");
   }
   return buildServerUrl;
+}
+
+/** The build server's compose token: DEVOTA_COMPOSE_TOKEN, else the file the
+ * server writes under its repo root. Read per call: the server may start later. */
+function composeTokenHeaders() {
+  let token = (env.DEVOTA_COMPOSE_TOKEN || "").trim();
+  if (!token) {
+    try {
+      token = fs.readFileSync(path.join(repoRoot, ".devota-cache", "compose-token"), "utf8").trim();
+    } catch {
+      token = "";
+    }
+  }
+  return token ? { "X-DevOTA-Compose-Token": token } : {};
 }
 
 async function buildServerJson(pathname, options = {}) {
@@ -1059,6 +1074,25 @@ server.registerTool(
       }),
     );
   },
+);
+
+server.registerTool(
+  "devota_terminal_compose",
+  {
+    title: "Send a Command to the Phone's Terminal Text Box",
+    description: "Put one shell command in the text box of the DevOTA terminal for this computer (the build server this MCP talks to). Nothing runs: the person reads it and presses send. One line, up to 4000 characters; it is handed to the phone once and expires after 30 minutes.",
+    inputSchema: {
+      text: z.string().min(1).max(4000),
+      label: z.string().max(80).optional(),
+    },
+  },
+  async ({ text, label }) => textResult(
+    await buildServerJson("/terminal/compose", {
+      method: "POST",
+      data: { text, label: label || "Agent" },
+      headers: composeTokenHeaders(),
+    }),
+  ),
 );
 
 server.registerTool(

@@ -10,6 +10,7 @@ import importlib.util
 from email import policy
 from email.parser import BytesParser
 import gzip
+import hmac
 import html
 import io
 import json
@@ -3176,6 +3177,92 @@ def download_github_artifact(
     }
 
 
+# Commands an agent hands to the person at the phone: each lands in the
+# terminal text box of the computer whose server received it, and runs only
+# when the person sends it. Kept in memory; undelivered ones expire.
+COMPOSE_MAX_CHARS = 4000
+COMPOSE_TTL_SECONDS = 30 * 60
+COMPOSE_MAX_PENDING = 20
+COMPOSE_LOCK = threading.Lock()
+COMPOSE_QUEUE: list[dict[str, Any]] = []
+COMPOSE_NEXT_ID = [1]
+COMPOSE_TOKEN_HEADER = "X-DevOTA-Compose-Token"
+COMPOSE_TOKEN: list[str] = [""]
+
+
+def compose_token_path(repo_root: Path) -> Path:
+    return repo_root / ".devota-cache" / "compose-token"
+
+
+def load_compose_token(repo_root: Path) -> str:
+    """The secret a non-loopback sender must present, created on first start.
+
+    Requests through a port proxy all appear to come from the proxy host, so
+    the sender's address cannot tell this machine from another; the token can.
+    It lives under the gitignored cache, readable only by this user."""
+    path = compose_token_path(repo_root)
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        token = ""
+    if len(token) < 32:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex + uuid.uuid4().hex
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(token + "\n")
+    os.chmod(path, 0o600)
+    COMPOSE_TOKEN[0] = token
+    return token
+
+
+def compose_sender_allowed(client_ip: str, presented_token: str | None) -> bool:
+    """A process on this machine (loopback), or anyone holding the token."""
+    client = client_ip.removeprefix("::ffff:")
+    if client == "::1" or client.startswith("127."):
+        return True
+    expected = COMPOSE_TOKEN[0]
+    return bool(expected) and presented_token is not None and hmac.compare_digest(presented_token.strip(), expected)
+
+
+def _compose_expire(now: float) -> None:
+    COMPOSE_QUEUE[:] = [item for item in COMPOSE_QUEUE
+                        if now - item["createdAtEpoch"] < COMPOSE_TTL_SECONDS][-COMPOSE_MAX_PENDING:]
+
+
+def propose_terminal_command(payload: dict[str, Any], now: float | None = None) -> dict[str, Any]:
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("text is required")
+    text = text.strip()
+    if "\n" in text or "\r" in text:
+        raise ValueError("send one command per line")
+    if len(text) > COMPOSE_MAX_CHARS:
+        raise ValueError(f"text is longer than {COMPOSE_MAX_CHARS} characters")
+    label = payload.get("label")
+    label = label.strip()[:80] if isinstance(label, str) else ""
+    now = time.time() if now is None else now
+    with COMPOSE_LOCK:
+        _compose_expire(now)
+        item = {"id": COMPOSE_NEXT_ID[0], "text": text, "label": label,
+                "createdAtEpoch": now,
+                "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
+        COMPOSE_NEXT_ID[0] += 1
+        COMPOSE_QUEUE.append(item)
+        _compose_expire(now)
+    return {"status": "ok", "id": item["id"]}
+
+
+def take_terminal_commands(now: float | None = None) -> dict[str, Any]:
+    """Hand over every pending command once; the phone fills its text box."""
+    now = time.time() if now is None else now
+    with COMPOSE_LOCK:
+        _compose_expire(now)
+        items = [{key: item[key] for key in ("id", "text", "label", "createdAt")} for item in COMPOSE_QUEUE]
+        COMPOSE_QUEUE.clear()
+    return {"status": "ok", "items": items}
+
+
 def make_handler(repo_root: Path, manifest_path: Path, manifest: dict[str, Any]):
     class DevotaHandler(SimpleHTTPRequestHandler):
         def send_json(self, payload: object, status: int = 200):
@@ -3328,6 +3415,16 @@ def make_handler(repo_root: Path, manifest_path: Path, manifest: dict[str, Any])
 
         def do_POST(self):
             path = unquote(urlparse(self.path).path)
+            if path == "/terminal/compose":
+                if not compose_sender_allowed(self.client_address[0], self.headers.get(COMPOSE_TOKEN_HEADER)):
+                    self.send_error(403, f"Send from this computer or with the {COMPOSE_TOKEN_HEADER} header")
+                    return
+                try:
+                    payload = parse_json_request(self, max_bytes=16 * 1024)
+                    self.send_json(propose_terminal_command(payload))
+                except Exception as exc:
+                    self.send_error(400, f"Command not accepted: {exc}")
+                return
             if path == "/macros/resolve":
                 try:
                     payload = parse_json_request(self, max_bytes=512 * 1024)
@@ -3592,6 +3689,10 @@ def make_handler(repo_root: Path, manifest_path: Path, manifest: dict[str, Any])
                 self.send_json(self.apps_payload())
                 return
 
+            if path == "/terminal/compose":
+                self.send_json(take_terminal_commands())
+                return
+
             if path == "/macros":
                 try:
                     self.send_json(list_macros(repo_root))
@@ -3719,6 +3820,7 @@ def main():
         resolvers = [*filter(None, os.environ.get(MACRO_RESOLVERS_ENV, "").split(os.pathsep)), *args.macro_resolver]
         for resolver in resolvers:
             load_macro_resolver(resolver)
+        load_compose_token(repo_root)
     except Exception as exc:
         raise SystemExit(f"DevOTA server configuration error: {exc}") from exc
 
