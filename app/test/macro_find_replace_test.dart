@@ -76,6 +76,21 @@ void main() {
     expect(restored.entries, history.entries);
   });
 
+  test('server presets decode from the presets endpoint shape', () {
+    final preset = MacroFindReplacePreset.fromJson({
+      'id': 'model-gemini-3-pro',
+      'label': 'Model → Gemini 3 Pro',
+      'builtin': false,
+      'pairs': [
+        {'find': 'GPT-6.1 Sol', 'replace': 'Gemini 3 Pro'},
+        {'find': 'gpt-6.1-sol', 'replace': 'gemini-3-pro'},
+      ],
+    });
+    expect(preset.label, 'Model → Gemini 3 Pro');
+    expect(preset.pairs, hasLength(2));
+    expect(preset.pairs.last.replace, 'gemini-3-pro');
+  });
+
   test('history persists through SharedPreferences cache', () async {
     SharedPreferences.setMockInitialValues({});
     await saveMacroFindReplaceHistory(

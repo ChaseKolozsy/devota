@@ -2803,6 +2803,230 @@ def delete_macro(repo_root: Path, macro_id: str) -> dict[str, Any]:
     return {"status": "ok", "deletedId": macro_id, "macros": next_store["macros"], "usageCounts": next_store["usageCounts"]}
 
 
+def find_replace_presets_path(repo_root: Path) -> Path:
+    return macros_path(repo_root).parent / "find-replace-presets.json"
+
+
+BUILTIN_FIND_REPLACE_PRESETS: list[dict[str, Any]] = [
+    {
+        "id": "model-gpt-6.1-sol",
+        "label": "Model → GPT-6.1 Sol",
+        "pairs": [
+            {"find": "Muse Wonder 1.0", "replace": "GPT-6.1 Sol"},
+            {"find": "muse-wonder-1.0", "replace": "gpt-6.1-sol"},
+        ],
+        "builtin": True,
+    },
+    {
+        "id": "model-muse-wonder-1.0",
+        "label": "Model → Muse Wonder 1.0",
+        "pairs": [
+            {"find": "GPT-6.1 Sol", "replace": "Muse Wonder 1.0"},
+            {"find": "gpt-6.1-sol", "replace": "muse-wonder-1.0"},
+        ],
+        "builtin": True,
+    },
+]
+
+
+def _preset_id(label: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+    return slug or "preset"
+
+
+def _normalize_find_replace_pairs(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("pairs must be a non-empty list of {find, replace}")
+    pairs = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("each pair must be an object with find and replace")
+        find = str(item.get("find") or "")
+        if not find:
+            raise ValueError("each pair needs a non-empty find")
+        pairs.append({"find": find, "replace": str(item.get("replace") or "")})
+    return pairs
+
+
+def _read_custom_find_replace_presets(repo_root: Path) -> list[dict[str, Any]]:
+    path = find_replace_presets_path(repo_root)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    items = data.get("presets") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    presets = []
+    for item in items:
+        if not isinstance(item, dict) or not item.get("label"):
+            continue
+        try:
+            pairs = _normalize_find_replace_pairs(item.get("pairs"))
+        except ValueError:
+            continue
+        presets.append(
+            {
+                "id": str(item.get("id") or _preset_id(str(item["label"]))),
+                "label": str(item["label"]),
+                "pairs": pairs,
+                "builtin": False,
+            }
+        )
+    return presets
+
+
+def list_find_replace_presets(repo_root: Path) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "presets": BUILTIN_FIND_REPLACE_PRESETS
+        + _read_custom_find_replace_presets(repo_root),
+    }
+
+
+def add_find_replace_preset(repo_root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Register a reusable find/replace preset (a 'swapper') on this server.
+
+    Custom presets persist beside the macro store and are returned by
+    GET /macros/find-replace-presets, so the app and other agents can apply
+    them later. Re-adding an existing custom label replaces its pairs.
+    """
+    label = str(payload.get("label") or "").strip()
+    if not label:
+        raise ValueError("label is required")
+    pairs = _normalize_find_replace_pairs(payload.get("pairs"))
+    preset = {"id": _preset_id(label), "label": label, "pairs": pairs, "builtin": False}
+    if any(p["label"] == label for p in BUILTIN_FIND_REPLACE_PRESETS):
+        raise ValueError(f"{label!r} is a built-in preset and cannot be replaced")
+    custom = [p for p in _read_custom_find_replace_presets(repo_root) if p["label"] != label]
+    custom.append(preset)
+    path = find_replace_presets_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"presets": custom}, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    return {"status": "ok", "preset": preset, "presets": list_find_replace_presets(repo_root)["presets"]}
+
+
+def _find_replace_pairs_for_payload(repo_root: Path, payload: dict[str, Any]) -> list[dict[str, str]]:
+    if payload.get("pairs"):
+        return _normalize_find_replace_pairs(payload["pairs"])
+    preset_ref = payload.get("preset") or payload.get("preset_id") or payload.get("preset_label")
+    if preset_ref:
+        for preset in list_find_replace_presets(repo_root)["presets"]:
+            if preset_ref in (preset["id"], preset["label"]):
+                return preset["pairs"]
+        raise ValueError(f"unknown find/replace preset: {preset_ref}")
+    raise ValueError("provide pairs or preset")
+
+
+def model_swap_pairs(from_model: Any, to_model: Any) -> list[dict[str, str]]:
+    if not isinstance(from_model, dict) or not isinstance(to_model, dict):
+        raise ValueError("from and to must be objects like {name, slug}")
+    pairs = []
+    for key in ("name", "slug"):
+        source = str(from_model.get(key) or "").strip()
+        target = str(to_model.get(key) or "").strip()
+        if source and target and source != target:
+            pairs.append({"find": source, "replace": target})
+    if not pairs:
+        raise ValueError("from and to must differ in name and/or slug")
+    return pairs
+
+
+def apply_macro_find_replace(repo_root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Apply literal find/replace pairs to macro step values on this server.
+
+    Accepts {pairs}, {preset: label-or-id}, or model fields via
+    swap_macro_model. Optional macro_ids / macro_names limit the scope;
+    dry_run reports counts without writing. Returns replacement counts per
+    affected macro so callers can verify exactly what changed.
+    """
+    pairs = _find_replace_pairs_for_payload(repo_root, payload)
+    macro_ids = payload.get("macro_ids")
+    macro_names = payload.get("macro_names")
+    dry_run = bool(payload.get("dry_run"))
+    store = read_macros_store(repo_root)
+    total = 0
+    affected: list[dict[str, Any]] = []
+    macros = []
+    for macro in store["macros"]:
+        if isinstance(macro_ids, list) and macro["id"] not in macro_ids:
+            macros.append(macro)
+            continue
+        if isinstance(macro_names, list) and macro["name"] not in macro_names:
+            macros.append(macro)
+            continue
+        count = 0
+        steps = []
+        for step in macro["steps"]:
+            value = str(step.get("value") or "")
+            for pair in pairs:
+                hits = value.count(pair["find"])
+                if hits:
+                    count += hits
+                    value = value.replace(pair["find"], pair["replace"])
+            steps.append({**step, "value": value} if count else step)
+        if count:
+            total += count
+            affected.append({"id": macro["id"], "name": macro["name"], "replacements": count})
+            macros.append({**macro, "steps": steps})
+        else:
+            macros.append(macro)
+    if total and not dry_run:
+        write_macros_store(repo_root, macro_store_payload(macros, store.get("usageCounts", {})))
+    return {
+        "status": "ok",
+        "dry_run": dry_run,
+        "pairs": pairs,
+        "replacements": total,
+        "affected_macros": affected,
+    }
+
+
+def swap_macro_model(repo_root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Swap one model for another across macros and register the swapper.
+
+    Body: {from: {name, slug}, to: {name, slug}, apply: bool (default true),
+    register_preset: bool (default true), macro_ids?, macro_names?,
+    dry_run?}. Registering makes 'Model → <to name>' available as a preset
+    for the app and later calls. Returns the apply result plus the preset.
+    """
+    pairs = model_swap_pairs(payload.get("from"), payload.get("to"))
+    to_model = payload["to"]
+    to_label = str(to_model.get("name") or to_model.get("slug") or "").strip()
+    preset = None
+    if payload.get("register_preset", True) and to_label:
+        registered = add_find_replace_preset(
+            repo_root, {"label": f"Model → {to_label}", "pairs": pairs}
+        )
+        preset = registered["preset"]
+    result: dict[str, Any] = {
+        "status": "ok",
+        "dry_run": bool(payload.get("dry_run")),
+        "pairs": pairs,
+        "replacements": 0,
+        "affected_macros": [],
+        "preset": preset,
+    }
+    if payload.get("apply", True):
+        result.update(
+            apply_macro_find_replace(
+                repo_root,
+                {
+                    "pairs": pairs,
+                    "macro_ids": payload.get("macro_ids"),
+                    "macro_names": payload.get("macro_names"),
+                    "dry_run": bool(payload.get("dry_run")),
+                },
+            )
+        )
+        result["preset"] = preset
+    return result
+
+
 def macro_runs_root(repo_root: Path) -> Path:
     return repo_root / ".devota-cache" / "macro-runs"
 
@@ -3507,6 +3731,24 @@ def make_handler(repo_root: Path, manifest_path: Path, manifest: dict[str, Any])
                     self.send_error(400, f"Macro run completion failed: {exc}")
                 return
 
+            if path in (
+                "/macros/find-replace-presets",
+                "/macros/find-replace",
+                "/macros/model-swap",
+            ):
+                try:
+                    payload = parse_json_request(self, max_bytes=16 * 1024 * 1024)
+                    if path == "/macros/find-replace-presets":
+                        result = add_find_replace_preset(repo_root, payload)
+                    elif path == "/macros/model-swap":
+                        result = swap_macro_model(repo_root, payload)
+                    else:
+                        result = apply_macro_find_replace(repo_root, payload)
+                    self.send_json(result)
+                except Exception as exc:
+                    self.send_error(400, f"Macro find/replace failed: {exc}")
+                return
+
             if path == "/macros" or path == "/macros/sync":
                 try:
                     payload = parse_json_request(self, max_bytes=16 * 1024 * 1024)
@@ -3759,6 +4001,13 @@ def make_handler(repo_root: Path, manifest_path: Path, manifest: dict[str, Any])
                     self.send_json(list_macros(repo_root))
                 except Exception as exc:
                     self.send_error(500, f"Macros read failed: {exc}")
+                return
+
+            if path == "/macros/find-replace-presets":
+                try:
+                    self.send_json(list_find_replace_presets(repo_root))
+                except Exception as exc:
+                    self.send_error(500, f"Macro presets read failed: {exc}")
                 return
 
             if path == "/macro-runs":

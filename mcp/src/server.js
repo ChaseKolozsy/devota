@@ -1160,6 +1160,112 @@ server.registerTool(
 );
 
 server.registerTool(
+  "devota_macros_find_replace_presets",
+  {
+    title: "List DevOTA Macro Find/Replace Presets",
+    description: "List reusable macro find/replace presets ('swappers') registered on the DevOTA build server, including the built-in model toggles. Register a new swapper with devota_macros_add_find_replace_preset or devota_macros_model_swap.",
+  },
+  async () => textResult(await buildServerJson("/macros/find-replace-presets")),
+);
+
+server.registerTool(
+  "devota_macros_add_find_replace_preset",
+  {
+    title: "Add DevOTA Macro Find/Replace Preset",
+    description: "Register a reusable find/replace preset (a 'swapper') on the DevOTA build server so the app and other agents can apply it later. Example: label 'Model → Gemini 3 Pro' with pairs [{find:'GPT-6.1 Sol',replace:'Gemini 3 Pro'},{find:'gpt-6.1-sol',replace:'gemini-3-pro'}]. Re-adding the same label replaces its pairs.",
+    inputSchema: {
+      label: z.string().min(1),
+      pairs: z
+        .array(
+          z.object({
+            find: z.string().min(1),
+            replace: z.string().default(""),
+          }),
+        )
+        .min(1),
+    },
+  },
+  async ({ label, pairs }) => textResult(
+    await buildServerJson("/macros/find-replace-presets", {
+      method: "POST",
+      data: { label, pairs },
+    }),
+  ),
+);
+
+server.registerTool(
+  "devota_macros_find_replace",
+  {
+    title: "Find & Replace Across DevOTA Macros",
+    description: "Apply literal find/replace pairs (or a registered preset by label/id) to macro step values on the DevOTA build server, without fetching and re-uploading each macro. Optionally limit with macroIds/macroNames; use dryRun to preview counts. Returns replacement counts per affected macro.",
+    inputSchema: {
+      pairs: z
+        .array(
+          z.object({
+            find: z.string().min(1),
+            replace: z.string().default(""),
+          }),
+        )
+        .min(1)
+        .optional(),
+      preset: z.string().optional(),
+      macroIds: z.array(z.string()).optional(),
+      macroNames: z.array(z.string()).optional(),
+      dryRun: z.boolean().default(false),
+    },
+  },
+  async ({ pairs, preset, macroIds, macroNames, dryRun }) => textResult(
+    await buildServerJson("/macros/find-replace", {
+      method: "POST",
+      data: {
+        ...(pairs !== undefined ? { pairs } : {}),
+        ...(preset !== undefined ? { preset } : {}),
+        ...(macroIds !== undefined ? { macro_ids: macroIds } : {}),
+        ...(macroNames !== undefined ? { macro_names: macroNames } : {}),
+        dry_run: dryRun,
+      },
+    }),
+  ),
+);
+
+server.registerTool(
+  "devota_macros_model_swap",
+  {
+    title: "Swap the Model Named in DevOTA Macros",
+    description: "Swap one model for another across macros in one call — for example from {name:'GPT-6.1 Sol',slug:'gpt-6.1-sol'} to {name:'Gemini 3 Pro',slug:'gemini-3-pro'} (Antigravity/Gemini or any other model). Both the display name and the model= slug are replaced. By default this also registers a reusable 'Model → <to>' preset (the new swapper) on the server and applies the swap; set apply:false to only register the swapper, registerPreset:false to only apply, or dryRun:true to preview counts.",
+    inputSchema: {
+      from: z.object({
+        name: z.string().optional(),
+        slug: z.string().optional(),
+      }),
+      to: z.object({
+        name: z.string().optional(),
+        slug: z.string().optional(),
+      }),
+      apply: z.boolean().default(true),
+      registerPreset: z.boolean().default(true),
+      macroIds: z.array(z.string()).optional(),
+      macroNames: z.array(z.string()).optional(),
+      dryRun: z.boolean().default(false),
+    },
+  },
+  async ({ from, to, apply, registerPreset, macroIds, macroNames, dryRun }) => textResult(
+    await buildServerJson("/macros/model-swap", {
+      method: "POST",
+      data: {
+        from,
+        to,
+        apply,
+        register_preset: registerPreset,
+        ...(macroIds !== undefined ? { macro_ids: macroIds } : {}),
+        ...(macroNames !== undefined ? { macro_names: macroNames } : {}),
+        dry_run: dryRun,
+      },
+    }),
+  ),
+);
+
+server.registerTool(
   "devota_macro_runs_list",
   {
     title: "List DevOTA Macro Runs",

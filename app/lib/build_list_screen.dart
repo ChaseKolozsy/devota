@@ -838,9 +838,33 @@ class _BuildListScreenState extends State<BuildListScreen>
   }
 
   Future<void> _findReplaceInAllMacros() async {
+    // Presets registered on the server (for example a model swapper an agent
+    // added for a new model) appear alongside the built-in toggles. Offline,
+    // the built-ins and the local cache still work.
+    var serverPresets = const <MacroFindReplacePreset>[];
+    try {
+      final resp = await _dio.get('$_baseUrl/macros/find-replace-presets');
+      final data = resp.data;
+      final raw = data is Map ? data['presets'] : null;
+      if (raw is List) {
+        serverPresets = raw
+            .whereType<Map>()
+            .map(
+              (preset) => MacroFindReplacePreset.fromJson(
+                Map<String, dynamic>.from(preset),
+              ),
+            )
+            .where(
+              (preset) => preset.label.isNotEmpty && preset.pairs.isNotEmpty,
+            )
+            .toList();
+      }
+    } catch (_) {}
+    if (!mounted) return;
     final pairs = await showMacroFindReplaceDialog(
       context,
       scopeLabel: 'all ${_macros.length} macros on this computer',
+      extraPresets: serverPresets,
     );
     if (pairs == null || !mounted) return;
     final before = List<TerminalMacro>.of(_macros);

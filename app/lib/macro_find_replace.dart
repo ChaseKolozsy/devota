@@ -49,6 +49,26 @@ class MacroFindReplacePreset {
 
   final String label;
   final List<MacroFindReplacePair> pairs;
+
+  /// A preset registered on a DevOTA server (GET /macros/find-replace-presets),
+  /// for example a model swapper an agent added for Gemini models.
+  factory MacroFindReplacePreset.fromJson(Map<String, dynamic> json) {
+    final rawPairs = json['pairs'];
+    return MacroFindReplacePreset(
+      label: json['label']?.toString() ?? '',
+      pairs: rawPairs is List
+          ? rawPairs
+                .whereType<Map>()
+                .map(
+                  (pair) => MacroFindReplacePair.fromJson(
+                    Map<String, dynamic>.from(pair),
+                  ),
+                )
+                .where((pair) => pair.find.isNotEmpty)
+                .toList()
+          : const <MacroFindReplacePair>[],
+    );
+  }
 }
 
 const macroFindReplacePresets = <MacroFindReplacePreset>[
@@ -198,14 +218,18 @@ Future<void> saveMacroFindReplaceHistory(
 Future<List<MacroFindReplacePair>?> showMacroFindReplaceDialog(
   BuildContext context, {
   required String scopeLabel,
+  List<MacroFindReplacePreset> extraPresets = const <MacroFindReplacePreset>[],
 }) async {
   final history = await loadMacroFindReplaceHistory();
   if (!context.mounted) return null;
   final result = await showModalBottomSheet<List<MacroFindReplacePair>>(
     context: context,
     isScrollControlled: true,
-    builder: (_) =>
-        _MacroFindReplaceSheet(scopeLabel: scopeLabel, history: history),
+    builder: (_) => _MacroFindReplaceSheet(
+      scopeLabel: scopeLabel,
+      history: history,
+      extraPresets: extraPresets,
+    ),
   );
   if (result == null || result.isEmpty) return null;
   var next = history;
@@ -220,10 +244,14 @@ class _MacroFindReplaceSheet extends StatefulWidget {
   const _MacroFindReplaceSheet({
     required this.scopeLabel,
     required this.history,
+    this.extraPresets = const <MacroFindReplacePreset>[],
   });
 
   final String scopeLabel;
   final MacroFindReplaceHistory history;
+
+  /// Presets registered on the DevOTA server, shown after the built-ins.
+  final List<MacroFindReplacePreset> extraPresets;
 
   @override
   State<_MacroFindReplaceSheet> createState() => _MacroFindReplaceSheetState();
@@ -268,7 +296,14 @@ class _MacroFindReplaceSheetState extends State<_MacroFindReplaceSheet> {
               spacing: 8,
               runSpacing: 8,
               children: [
-                for (final preset in macroFindReplacePresets)
+                for (final preset in [
+                  ...macroFindReplacePresets,
+                  ...widget.extraPresets.where(
+                    (extra) => !macroFindReplacePresets.any(
+                      (builtin) => builtin.label == extra.label,
+                    ),
+                  ),
+                ])
                   ActionChip(
                     avatar: const Icon(Icons.swap_horiz, size: 16),
                     label: Text(preset.label),
