@@ -2,6 +2,7 @@ import 'package:devota/macro_editor_screen.dart';
 import 'package:devota/terminal_macro.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 const _longCommand =
     'cd /home/chase/dev-ota && flutter build apk --debug --split-per-abi '
@@ -216,6 +217,35 @@ void main() {
 
     final saved = await result;
     expect(saved!.steps.single.value, 'z');
+  });
+
+  testWidgets('model toggle find & replace rewrites the macro', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final result = await _openEditor(
+      tester,
+      _shellMacro(
+        'Run Muse Wonder 1.0 MEDIUM (model=muse-wonder-1.0, '
+        'reasoning_effort=medium)',
+      ),
+    );
+
+    await tester.tap(find.byTooltip('Find & replace in this macro'));
+    await tester.pumpAndSettle();
+    expect(find.text('Model → GPT-6.1 Sol'), findsOneWidget);
+
+    await tester.tap(find.text('Model → GPT-6.1 Sol'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('2 replacements made'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+    await tester.pumpAndSettle();
+
+    final saved = await result;
+    expect(
+      saved!.steps.single.value,
+      'Run GPT-6.1 Sol MEDIUM (model=gpt-6.1-sol, '
+      'reasoning_effort=medium)',
+    );
   });
 
   test('delay parsing rejects junk and negatives', () {

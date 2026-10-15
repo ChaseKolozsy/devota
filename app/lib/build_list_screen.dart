@@ -19,6 +19,7 @@ import 'device_macro_local_http.dart';
 import 'device_macro_runner.dart';
 import 'files_tab.dart';
 import 'macro_editor_screen.dart';
+import 'macro_find_replace.dart';
 import 'macro_reorder.dart';
 import 'macro_sync_service.dart';
 import 'openai_key_dialog.dart';
@@ -834,6 +835,41 @@ class _BuildListScreenState extends State<BuildListScreen>
     if (index < 0) return;
     setState(() => _macros[index] = edited);
     unawaited(_saveMacros());
+  }
+
+  Future<void> _findReplaceInAllMacros() async {
+    final pairs = await showMacroFindReplaceDialog(
+      context,
+      scopeLabel: 'all ${_macros.length} macros on this computer',
+    );
+    if (pairs == null || !mounted) return;
+    final before = List<TerminalMacro>.of(_macros);
+    final outcome = applyMacroFindReplaceToMacros(_macros, pairs);
+    if (outcome.replacements == 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No matches found in any macro.')),
+      );
+      return;
+    }
+    setState(() => _macros = outcome.macros);
+    unawaited(_saveMacros());
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+          '${outcome.replacements} replacement${outcome.replacements == 1 ? '' : 's'} '
+          'in ${outcome.affectedMacros} macro${outcome.affectedMacros == 1 ? '' : 's'}.',
+        ),
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () {
+            setState(() => _macros = before);
+            unawaited(_saveMacros());
+          },
+        ),
+      ),
+    );
   }
 
   void _duplicateMacro(TerminalMacro macro) {
@@ -2450,6 +2486,12 @@ class _BuildListScreenState extends State<BuildListScreen>
                     color: Theme.of(context).colorScheme.onSurfaceVariant,
                   ),
                 ),
+              ),
+              const SizedBox(width: 8),
+              IconButton.outlined(
+                icon: const Icon(Icons.find_replace),
+                tooltip: 'Find & replace in all macros',
+                onPressed: _findReplaceInAllMacros,
               ),
               const SizedBox(width: 8),
               FilledButton.icon(

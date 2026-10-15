@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'macro_find_replace.dart';
 import 'terminal_macro.dart';
 
 /// Full-screen macro editing.
@@ -318,6 +319,54 @@ class _MacroEditorScreenState extends State<MacroEditorScreen> {
     );
   }
 
+  Future<void> _findReplace() async {
+    final pairs = await showMacroFindReplaceDialog(
+      context,
+      scopeLabel: "this macro's steps",
+    );
+    if (pairs == null || !mounted) return;
+    final before = <(String, String)>[
+      for (final draft in _drafts)
+        (draft.valueController.text, draft.optionValue),
+    ];
+    var replacements = 0;
+    setState(() {
+      for (final draft in _drafts) {
+        final text = applyMacroFindReplacePairs(
+          draft.valueController.text,
+          pairs,
+        );
+        replacements += text.replacements;
+        if (text.replacements > 0) draft.valueController.text = text.text;
+        final option = applyMacroFindReplacePairs(draft.optionValue, pairs);
+        replacements += option.replacements;
+        if (option.replacements > 0) draft.optionValue = option.text;
+      }
+    });
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+          replacements == 0
+              ? 'No matches found.'
+              : '$replacements replacement${replacements == 1 ? '' : 's'} made. Save to keep them.',
+        ),
+        action: replacements == 0
+            ? null
+            : SnackBarAction(
+                label: 'Undo',
+                onPressed: () => setState(() {
+                  for (var i = 0; i < _drafts.length; i++) {
+                    _drafts[i].valueController.text = before[i].$1;
+                    _drafts[i].optionValue = before[i].$2;
+                  }
+                }),
+              ),
+      ),
+    );
+  }
+
   void _save() {
     FocusManager.instance.primaryFocus?.unfocus();
     final steps = _drafts
@@ -385,6 +434,11 @@ class _MacroEditorScreenState extends State<MacroEditorScreen> {
         appBar: AppBar(
           title: Text(widget.isNew ? 'New macro' : 'Edit macro'),
           actions: [
+            IconButton(
+              icon: const Icon(Icons.find_replace),
+              tooltip: 'Find & replace in this macro',
+              onPressed: _findReplace,
+            ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8),
               child: FilledButton.icon(
