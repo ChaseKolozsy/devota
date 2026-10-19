@@ -122,3 +122,34 @@ The `devota_macros_*` and `devota_projects_*` tools require
 `DEVOTA_BUILD_SERVER_URL` because they use the build server's local APIs. Email
 sending also requires Postmark settings to be saved from the DevOTA Projects tab
 or via `POST /projects/email/config`.
+
+## Windows startup agent host
+
+The existing `C:\Users\chase\cradlespeak_build_relay.py` Startup-folder
+service also supervises `src/windows_agent_host.js`. It preserves the existing
+port forwards and restarts the agent host after failure, retrying while
+WSL or ZeroTier is unavailable. The current Startup entry runs at Windows
+sign-in (not before sign-in); no second Startup entry is needed.
+
+The maintained copy of the startup supervisor is
+`scripts/setup/windows-build-relay.py` in this repository. To update an existing
+installation, copy it over `C:\Users\chase\cradlespeak_build_relay.py` and restart
+that supervisor. Keep the private configuration outside the repository.
+
+Private configuration is `%LOCALAPPDATA%\DevOTA\agent-relay.json` with
+`pairToken`, `repoRoot` (Windows UNC path to dev-ota), `wsHost` (ZeroTier IP),
+`wsPort` (8083), `controlPort` (18783), and `buildServerUrl`. Preserve the current
+pair token. Logs go to `%LOCALAPPDATA%\DevOTA\agent-relay.log`.
+
+The host keeps the MCP stdio channel alive so a connected phone remains
+controllable. Its local JSON API binds only `127.0.0.1:18783`:
+
+- `GET /health`: host readiness and process ID (no pairing secret).
+- `GET /tools`: tool names and input schemas.
+- `POST /` with `Content-Type: application/json` and
+  `{"name":"android_status","arguments":{}}`: invoke an MCP tool.
+
+Browser-originated requests are rejected. Access the loopback API locally;
+never publish/forward its port. Phones continue using the existing
+`ws://10.243.53.96:8083/phone` address and pairing token. The phone WebSocket
+binds to the configured ZeroTier interface, rather than every Windows interface.

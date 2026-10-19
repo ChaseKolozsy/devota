@@ -25,6 +25,7 @@ const DEFAULT_DEVOTA_PACKAGE = "io.github.chasekolozsy.devota";
 const env = process.env;
 const pairToken = env.DEVOTA_PAIR_TOKEN || randomBytes(12).toString("hex");
 const wsPort = Number.parseInt(env.DEVOTA_WS_PORT || "8083", 10);
+const wsHost = env.DEVOTA_WS_HOST || "0.0.0.0";
 const buildServerUrl = env.DEVOTA_BUILD_SERVER_URL ? stripTrailingSlash(env.DEVOTA_BUILD_SERVER_URL) : null;
 const wholeDeviceEnabled = env.DEVOTA_ENABLE_WHOLE_DEVICE === "1";
 const buildCommandsEnabled = env.DEVOTA_ENABLE_BUILD_COMMANDS === "1";
@@ -326,12 +327,12 @@ const phone = new PhoneRegistry({
   onHostCommand: privilegedMacrosEnabled ? executePrivilegedMacroCommand : null,
 });
 
-const wss = new WebSocketServer({ host: "0.0.0.0", port: wsPort, path: "/phone" });
+const wss = new WebSocketServer({ host: wsHost, port: wsPort, path: "/phone" });
 wss.on("connection", (socket, request) => phone.attach(socket, request));
 wss.on("listening", () => {
   const address = wss.address();
   const actualPort = typeof address === "object" && address ? address.port : wsPort;
-  console.error(`[devota_mcp] phone relay listening on ws://0.0.0.0:${actualPort}/phone`);
+  console.error(`[devota_mcp] phone relay listening on ws://${wsHost}:${actualPort}/phone`);
   console.error(`[devota_mcp] pair token: ${env.DEVOTA_PAIR_TOKEN ? "configured" : "generated for this process"}`);
   console.error(`[devota_mcp] build server URL for phone installs: ${buildServerUrl || "not configured"}`);
   console.error(`[devota_mcp] privileged host macros: ${privilegedMacrosEnabled ? "enabled" : "disabled"}`);
