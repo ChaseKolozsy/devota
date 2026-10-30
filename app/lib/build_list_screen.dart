@@ -1,3 +1,4 @@
+import 'apk_stream_extract.dart';
 import 'serial_agent_writes.dart';
 import 'dart:async';
 import 'dart:convert';
@@ -1804,9 +1805,11 @@ class _BuildListScreenState extends State<BuildListScreen>
       _downloadStatus[path] = 'Downloading... 0s';
     });
 
+    Directory? downloadStaging;
     try {
       final cacheDir = await _getApkCacheDir();
-      final gzPath = '${cacheDir.path}/$cacheFileName.gz';
+      downloadStaging = await cacheDir.createTemp('.apk-download-');
+      final gzPath = '${downloadStaging.path}/payload.gz';
       final apkPath = '${cacheDir.path}/$cacheFileName';
 
       // Download compressed .gz
@@ -1833,12 +1836,11 @@ class _BuildListScreenState extends State<BuildListScreen>
         _downloadProgress[path] = 0.9;
       });
 
-      final gzFile = File(gzPath);
-      final apkFile = File(apkPath);
-      final gzBytes = await gzFile.readAsBytes();
-      final decompressed = gzip.decode(gzBytes);
-      await apkFile.writeAsBytes(decompressed);
-      await gzFile.delete();
+      await extractApkStream(
+        File(gzPath).openRead(),
+        File(apkPath),
+        expectedBytes: _asInt(build['size']),
+      );
 
       stopwatch.stop();
       final totalSecs = stopwatch.elapsed.inSeconds;
@@ -1899,6 +1901,10 @@ class _BuildListScreenState extends State<BuildListScreen>
       }
       if (throwOnError) rethrow;
       return {'ok': false, 'path': path, 'error': e.toString()};
+    } finally {
+      if (downloadStaging != null && await downloadStaging.exists()) {
+        await downloadStaging.delete(recursive: true);
+      }
     }
   }
 
