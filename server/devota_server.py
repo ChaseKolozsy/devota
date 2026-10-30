@@ -431,6 +431,11 @@ def resolve_download_target(
         target = (app_root / app_rel).resolve()
         if not is_relative_to(target, app_root):
             raise PermissionError("download path escapes app root")
+        if target.suffix == ".apk" and not any(
+            is_relative_to(target, build_dir["absolute"])
+            for build_dir in app["buildDirs"]
+        ):
+            raise FileNotFoundError("APK is outside registered build directories")
         return target, f"apps/{app_id}/{app_rel}"
 
     # Backward-compatible path resolver for older clients/manifests.
