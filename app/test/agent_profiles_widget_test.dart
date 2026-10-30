@@ -103,6 +103,23 @@ void main() {
       await tab(7);
       expect(find.text('Computer: Desktop'), findsOneWidget);
       expect(find.text('original-test-token'), findsOneWidget);
+      final urlField = find.widgetWithText(TextField, 'Agent WebSocket URL');
+      final tokenField = find.widgetWithText(TextField, 'Pair token');
+      const testUrl = 'ws://example.test:8083/phone';
+      const testToken = 'synthetic-fast-typing-token';
+      for (var i = 1; i <= testUrl.length; i++) {
+        await tester.enterText(urlField, testUrl.substring(0, i));
+      }
+      for (var i = 1; i <= testToken.length; i++) {
+        await tester.enterText(tokenField, testToken.substring(0, i));
+      }
+      await tester.pumpAndSettle();
+      await tab(0);
+      await select('Palm');
+      await select('Desktop');
+      await tab(7);
+      expect(find.text(testUrl), findsOneWidget);
+      expect(find.text(testToken), findsOneWidget);
       await tab(0);
       await tester.tap(find.text('New computer'));
       await tester.pumpAndSettle();
@@ -121,7 +138,7 @@ void main() {
       await tab(0);
       await select('Desktop');
       await tab(7);
-      expect(find.text('original-test-token'), findsOneWidget);
+      expect(find.text(testToken), findsOneWidget);
       expect(
         calls.where((c) => c.method == 'startAgent' || c.method == 'stopAgent'),
         isEmpty,

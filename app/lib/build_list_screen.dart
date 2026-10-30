@@ -1,3 +1,4 @@
+import 'serial_agent_writes.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -1403,9 +1404,12 @@ class _BuildListScreenState extends State<BuildListScreen>
     }
   }
 
-  Future<void> _saveAgentSettings() async {
+  final _agentSettingsWrites = SerialAgentWrites();
+  int _agentEditRevision = 0;
+
+  Future<void> _saveAgentSettings() {
     final profiles = _computerProfiles;
-    if (profiles == null) return;
+    if (profiles == null) return Future.value();
     final current = profiles.selected;
     final updated = current.copyWith(
       agentUrl: _agentUrlController.text.trim(),
@@ -1413,22 +1417,29 @@ class _BuildListScreenState extends State<BuildListScreen>
     );
     final token = _agentTokenController.text.trim();
     profiles.updateProfile(updated);
-    await _profileStorage.write(
-      key: current.secretKey('agent_token'),
-      value: token,
-    );
-    final prefs = await SharedPreferences.getInstance();
-    await profiles.save(prefs, _profileStorage);
-    _scheduleServerBackup();
+    return _agentSettingsWrites.enqueue(() async {
+      await _profileStorage.write(
+        key: current.secretKey('agent_token'),
+        value: token,
+      );
+      final prefs = await SharedPreferences.getInstance();
+      await profiles.save(prefs, _profileStorage);
+      _scheduleServerBackup();
+    });
   }
 
   Future<void> _applyAgentProfile() async {
     final profiles = _computerProfiles;
     if (profiles == null) return;
     final profile = profiles.selected;
+    final revision = _agentEditRevision;
     final token =
         await _profileStorage.read(key: profile.secretKey('agent_token')) ?? '';
-    if (!mounted) return;
+    if (!mounted ||
+        profiles.selectedId != profile.id ||
+        revision != _agentEditRevision) {
+      return;
+    }
     _agentUrlController.text = profile.agentUrl;
     _agentTokenController.text = token;
     _agentWholeDevice = profile.agentWholeDevice;
@@ -2713,7 +2724,10 @@ class _BuildListScreenState extends State<BuildListScreen>
           ),
           keyboardType: TextInputType.url,
           textInputAction: TextInputAction.next,
-          onChanged: (_) => _saveAgentSettings(),
+          onChanged: (_) {
+            _agentEditRevision++;
+            _saveAgentSettings();
+          },
         ),
         const SizedBox(height: 10),
         TextField(
@@ -2724,7 +2738,10 @@ class _BuildListScreenState extends State<BuildListScreen>
           ),
           obscureText: true,
           textInputAction: TextInputAction.done,
-          onChanged: (_) => _saveAgentSettings(),
+          onChanged: (_) {
+            _agentEditRevision++;
+            _saveAgentSettings();
+          },
         ),
         const SizedBox(height: 8),
         SwitchListTile(
@@ -2733,6 +2750,7 @@ class _BuildListScreenState extends State<BuildListScreen>
           value: _agentWholeDevice,
           onChanged: (v) {
             setState(() => _agentWholeDevice = v);
+            _agentEditRevision++;
             _saveAgentSettings();
           },
         ),
